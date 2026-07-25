@@ -56,3 +56,13 @@ _bmad-output/*
 .DS_Store
 ._*
 .gocache/
+
+# Local artifacts and nested repositories
+cli-proxy-api.bak-*
+cliproxyapi
+/cpactl
+.codegraph/
+.omc/
+management-center/
+CPA-Manager-Plus/
+static/*.bak-*

@@ -132,7 +132,8 @@ save-cooldown-status: false
 
 # Cooldown duration in seconds for transient upstream errors (408/500/502/503/504).
 # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
-transient-error-cooldown-seconds: 0
+response-header-timeout-seconds: 20 # first-byte/header timeout; 0=default 20s, negative=disable
+# transient-error-cooldown-seconds: 0
 
 # When true, globally disable Claude request cloaking (the Claude Code CLI disguise and
 # system prompt replacement), so the original system prompt is passed through to Claude as-is.
@@ -194,6 +195,7 @@ nonstream-keepalive-interval: 0
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   first-chunk-timeout-seconds: 30  # Wait for first non-empty stream payload after open; 0=default 30s, negative=disable.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.

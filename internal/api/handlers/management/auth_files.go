@@ -38,6 +38,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
@@ -67,6 +68,8 @@ var (
 	errPluginVirtualAuth  = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
 	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
 )
+
+const quotaCheckMetadataKey = "management_quota_check"
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
@@ -432,6 +435,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						fileData["note"] = trimmed
 					}
 				}
+				if sv := gjson.GetBytes(data, "supplier"); sv.Exists() && sv.Type == gjson.String {
+					if trimmed := strings.TrimSpace(sv.String()); trimmed != "" {
+						fileData["supplier"] = trimmed
+					}
+				}
 				if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
 					switch wv.Type {
 					case gjson.True:
@@ -450,6 +458,59 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 		}
 	}
 	c.JSON(200, gin.H{"files": files})
+}
+
+func classifyAuthFileProblem(auth *coreauth.Auth) (kind string, cooldown bool, nextRetry time.Time) {
+	if auth == nil {
+		return "none", false, time.Time{}
+	}
+	now := time.Now()
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		msg := strings.ToLower(strings.TrimSpace(auth.StatusMessage))
+		if strings.Contains(msg, "health") || strings.Contains(msg, "quota refresh failed") || strings.Contains(msg, "invalid_grant") || strings.Contains(msg, "unauthorized") || strings.Contains(msg, "forbidden") || strings.Contains(msg, "credential") {
+			return "credential", false, time.Time{}
+		}
+		if auth.LastError != nil {
+			code := strings.ToLower(strings.TrimSpace(auth.LastError.Code))
+			if code == "management_health_check" || code == "management_quota_check" {
+				return "credential", false, time.Time{}
+			}
+		}
+		return "disabled", false, time.Time{}
+	}
+
+	// Model-level cooldown: any model still waiting.
+	earliest := time.Time{}
+	if auth.Unavailable && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+		earliest = auth.NextRetryAfter
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+			if earliest.IsZero() || state.NextRetryAfter.Before(earliest) {
+				earliest = state.NextRetryAfter
+			}
+		}
+	}
+	if !earliest.IsZero() {
+		return "cooldown", true, earliest
+	}
+
+	msg := strings.ToLower(strings.TrimSpace(auth.StatusMessage))
+	if strings.HasPrefix(msg, "quota refresh failed:") {
+		return "quota", false, time.Time{}
+	}
+	if auth.Status == coreauth.StatusError || auth.Unavailable || msg != "" {
+		if strings.Contains(msg, "quota") || strings.Contains(msg, "rate") {
+			return "quota", false, time.Time{}
+		}
+		if msg != "" || auth.Status == coreauth.StatusError {
+			return "error", false, time.Time{}
+		}
+	}
+	return "none", false, time.Time{}
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
@@ -487,6 +548,14 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	if auth.Metadata != nil {
+		if healthCheck, ok := auth.Metadata[healthCheckMetadataKey]; ok {
+			entry["health_check"] = healthCheck
+		}
+		if excludedModels := authFileExcludedModels(auth.Metadata); len(excludedModels) > 0 {
+			entry["excluded_models"] = excludedModels
+		}
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}
@@ -513,6 +582,15 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
+	}
+	problemKind, inCooldown, cooldownUntil := classifyAuthFileProblem(auth)
+	entry["problem_kind"] = problemKind
+	entry["in_cooldown"] = inCooldown
+	if !cooldownUntil.IsZero() {
+		entry["cooldown_until"] = cooldownUntil
+		if auth.NextRetryAfter.IsZero() || !auth.NextRetryAfter.After(time.Now()) {
+			entry["next_retry_after"] = cooldownUntil
+		}
 	}
 	if path != "" {
 		entry["path"] = path
@@ -561,6 +639,16 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		if rawNote, ok := auth.Metadata["note"].(string); ok {
 			if trimmed := strings.TrimSpace(rawNote); trimmed != "" {
 				entry["note"] = trimmed
+			}
+		}
+	}
+	// Optional supplier/group for bulk-imported free credentials.
+	if supplier := strings.TrimSpace(authAttribute(auth, "supplier")); supplier != "" {
+		entry["supplier"] = supplier
+	} else if auth.Metadata != nil {
+		if rawSupplier, ok := auth.Metadata["supplier"].(string); ok {
+			if trimmed := strings.TrimSpace(rawSupplier); trimmed != "" {
+				entry["supplier"] = trimmed
 			}
 		}
 	}
@@ -739,6 +827,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	supplier := strings.TrimSpace(c.PostForm("supplier"))
+	if supplier == "" {
+		supplier = strings.TrimSpace(c.Query("supplier"))
+	}
 
 	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
 	if errMultipart != nil {
@@ -746,7 +838,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if len(fileHeaders) == 1 {
-		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
+		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0], supplier); errUpload != nil {
 			if errors.Is(errUpload, errAuthFileMustBeJSON) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
 				return
@@ -761,7 +853,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		uploaded := make([]string, 0, len(fileHeaders))
 		failed := make([]gin.H, 0)
 		for _, file := range fileHeaders {
-			name, errUpload := h.storeUploadedAuthFile(ctx, file)
+			name, errUpload := h.storeUploadedAuthFile(ctx, file, supplier)
 			if errUpload != nil {
 				failureName := ""
 				if file != nil {
@@ -806,6 +898,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
+	data = applySupplierToAuthJSON(data, supplier)
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -919,7 +1012,7 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
 	return headers, nil
 }
 
-func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader, supplier string) (string, error) {
 	if file == nil {
 		return "", fmt.Errorf("no file uploaded")
 	}
@@ -937,6 +1030,7 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 	if err != nil {
 		return "", fmt.Errorf("failed to read uploaded file: %w", err)
 	}
+	data = applySupplierToAuthJSON(data, supplier)
 	if err := h.writeAuthFile(ctx, name, data); err != nil {
 		return "", err
 	}
@@ -1339,6 +1433,150 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
+// PatchAuthFileQuotaStatus persists the result of a management-center quota check.
+// Credential failures are quarantined so they cannot be selected by normal routing
+// until an operator re-enables or deletes the auth file.
+func (h *Handler) PatchAuthFileQuotaStatus(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name       string `json:"name"`
+		Success    bool   `json:"success"`
+		Message    string `json:"message"`
+		StatusCode int    `json:"status_code"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		for _, auth := range h.authManager.List() {
+			if auth != nil && auth.FileName == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if coreauth.IsPluginVirtualAuth(targetAuth) {
+		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
+		return
+	}
+
+	if targetAuth.Metadata == nil {
+		targetAuth.Metadata = make(map[string]any)
+	}
+
+	if req.Success {
+		clearQuotaCheckStatus(targetAuth)
+	} else {
+		applyQuotaCheckFailure(targetAuth, req.Message, req.StatusCode)
+	}
+	targetAuth.UpdatedAt = time.Now()
+
+	if _, err := h.authManager.Update(c.Request.Context(), targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":      "ok",
+		"success":     req.Success,
+		"quarantined": targetAuth.Disabled,
+	})
+}
+
+func applyQuotaCheckFailure(auth *coreauth.Auth, message string, statusCode int) {
+	if auth == nil {
+		return
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "quota refresh failed"
+	}
+	quarantined := isQuotaCredentialFailure(message, statusCode)
+	auth.Metadata[quotaCheckMetadataKey] = map[string]any{
+		"message":     message,
+		"status_code": statusCode,
+		"quarantined": quarantined,
+	}
+
+	quotaMessage := "quota refresh failed: " + message
+	if auth.StatusMessage == "" || isQuotaCheckStatusMessage(auth.StatusMessage, auth.Metadata[quotaCheckMetadataKey]) {
+		auth.StatusMessage = quotaMessage
+	}
+	if !quarantined {
+		return
+	}
+
+	auth.Disabled = true
+	auth.Status = coreauth.StatusDisabled
+	auth.Unavailable = false
+	auth.NextRetryAfter = time.Time{}
+	auth.LastError = &coreauth.Error{
+		Code:       "management_quota_check",
+		Message:    message,
+		HTTPStatus: statusCode,
+	}
+	auth.Metadata["disabled"] = true
+}
+
+func clearQuotaCheckStatus(auth *coreauth.Auth) {
+	if auth == nil || auth.Metadata == nil {
+		return
+	}
+	marker, ok := auth.Metadata[quotaCheckMetadataKey].(map[string]any)
+	if !ok {
+		delete(auth.Metadata, quotaCheckMetadataKey)
+		return
+	}
+	delete(auth.Metadata, quotaCheckMetadataKey)
+	if isQuotaCheckStatusMessage(auth.StatusMessage, marker) {
+		auth.StatusMessage = ""
+	}
+	if auth.LastError != nil && auth.LastError.Code == "management_quota_check" {
+		auth.LastError = nil
+	}
+}
+
+func isQuotaCheckStatusMessage(message string, marker any) bool {
+	message = strings.TrimSpace(message)
+	markerMap, ok := marker.(map[string]any)
+	if !ok {
+		return strings.HasPrefix(message, "quota refresh failed:")
+	}
+	previous, _ := markerMap["message"].(string)
+	return message == "quota refresh failed: "+strings.TrimSpace(previous)
+}
+
+func isQuotaCredentialFailure(message string, statusCode int) bool {
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+		return true
+	}
+	lower := strings.ToLower(message)
+	for _, marker := range []string{"invalid_grant", "invalid or expired credentials", "refresh token", "unauthorized", "forbidden"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // patchPluginVirtualSourceStatus toggles disabled on a plugin multi-auth source file and all
 // runtime auths expanded from it. Virtual project children cannot be toggled independently.
 func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth *coreauth.Auth, disabled bool) error {
@@ -1511,6 +1749,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 	if changed {
 		syncAuthFileMetadataFields(targetAuth, touchedRoots)
+		if _, ok := touchedRoots["excluded_models"]; ok {
+			syncAuthFileExcludedModels(targetAuth, h.cfg)
+		}
+		if _, ok := touchedRoots["excluded-models"]; ok {
+			syncAuthFileExcludedModels(targetAuth, h.cfg)
+		}
 	}
 
 	if !changed {
@@ -1666,6 +1910,48 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	}
 }
 
+func authFileExcludedModels(metadata map[string]any) []string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	raw, ok := metadata["excluded_models"]
+	if !ok {
+		raw = metadata["excluded-models"]
+	}
+	var values []string
+	switch typed := raw.(type) {
+	case []string:
+		values = typed
+	case []any:
+		values = make([]string, 0, len(typed))
+		for _, item := range typed {
+			if value, okString := item.(string); okString {
+				values = append(values, value)
+			}
+		}
+	case string:
+		values = strings.FieldsFunc(typed, func(r rune) bool { return r == ',' || r == '\n' })
+	}
+	return config.NormalizeExcludedModels(values)
+}
+
+func syncAuthFileExcludedModels(auth *coreauth.Auth, cfg *config.Config) {
+	if auth == nil || cfg == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	delete(auth.Attributes, "excluded_models")
+	delete(auth.Attributes, "excluded_models_hash")
+	synthesizer.ApplyAuthExcludedModelsMeta(
+		auth,
+		cfg,
+		authFileExcludedModels(auth.Metadata),
+		auth.AuthKind(),
+	)
+}
+
 func syncAuthFileHeaderAttributes(auth *coreauth.Auth) {
 	if auth == nil {
 		return
@@ -1740,6 +2026,42 @@ func syncAuthFileNoteAttribute(auth *coreauth.Auth) {
 		return
 	}
 	auth.Attributes["note"] = note
+}
+
+func syncAuthFileSupplierAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	if auth.Metadata == nil {
+		delete(auth.Attributes, "supplier")
+		return
+	}
+	supplier, ok := auth.Metadata["supplier"].(string)
+	if !ok {
+		delete(auth.Attributes, "supplier")
+		return
+	}
+	supplier = strings.TrimSpace(supplier)
+	if supplier == "" {
+		delete(auth.Attributes, "supplier")
+		return
+	}
+	auth.Attributes["supplier"] = supplier
+}
+
+func applySupplierToAuthJSON(data []byte, supplier string) []byte {
+	supplier = strings.TrimSpace(supplier)
+	if supplier == "" || len(data) == 0 {
+		return data
+	}
+	out, err := sjson.SetBytes(data, "supplier", supplier)
+	if err != nil {
+		return data
+	}
+	return out
 }
 
 func syncAuthFileWebsocketsAttribute(auth *coreauth.Auth) {

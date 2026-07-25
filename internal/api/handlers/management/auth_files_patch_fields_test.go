@@ -276,3 +276,67 @@ func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 		t.Fatalf("fgh.ijk = %#v, want true", got)
 	}
 }
+
+func TestPatchAuthFileFields_ExcludedModelsUpdatesOAuthRoutingMetadata(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "oauth.json",
+		FileName: "oauth.json",
+		Provider: "antigravity",
+		Attributes: map[string]string{
+			"path":      "/tmp/oauth.json",
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{
+			"type":            "antigravity",
+			"excluded_models": []any{"old-model"},
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: t.TempDir(),
+		OAuthExcludedModels: map[string][]string{
+			"antigravity": {"global-model"},
+		},
+	}, manager)
+
+	body := `{"name":"oauth.json","excluded_models":["Model-A","model-b","model-a"]}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("oauth.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["excluded_models"]; got != "global-model,model-a,model-b" {
+		t.Fatalf("excluded_models attribute = %q, want merged normalized models", got)
+	}
+	entry := h.buildAuthFileEntry(updated)
+	gotModels, ok := entry["excluded_models"].([]string)
+	if !ok {
+		t.Fatalf("entry excluded_models = %#v, want []string", entry["excluded_models"])
+	}
+	wantModels := []string{"model-a", "model-b"}
+	if len(gotModels) != len(wantModels) {
+		t.Fatalf("entry excluded_models = %#v, want %#v", gotModels, wantModels)
+	}
+	for i := range wantModels {
+		if gotModels[i] != wantModels[i] {
+			t.Fatalf("entry excluded_models = %#v, want %#v", gotModels, wantModels)
+		}
+	}
+}

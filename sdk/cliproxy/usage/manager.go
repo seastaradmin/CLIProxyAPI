@@ -24,7 +24,13 @@ type Record struct {
 	AuthID       string
 	AuthIndex    string
 	AuthType     string
-	Source       string
+	// BaseURL is the upstream channel base URL when known (openai-compat etc).
+	BaseURL string
+	// Protocol is the upstream protocol label used for this attempt (chat/responses/messages).
+	Protocol string
+	// Supplier is an optional operator-defined group for bulk-imported credentials.
+	Supplier string
+	Source   string
 	// ReasoningEffort stores the translated upstream thinking level for request event logs.
 	ReasoningEffort string
 	// ServiceTier stores the client-requested service tier for request event logs.

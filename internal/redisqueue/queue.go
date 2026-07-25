@@ -95,6 +95,40 @@ func PopOldest(count int) [][]byte {
 	return global.popOldest(count)
 }
 
+// SnapshotNewest returns up to count newest payloads without removing them.
+// Results are ordered newest-first.
+func SnapshotNewest(count int) [][]byte {
+	if !Enabled() {
+		return nil
+	}
+	if count <= 0 {
+		return nil
+	}
+	return global.snapshotNewest(count)
+}
+
+func (q *queue) snapshotNewest(count int) [][]byte {
+	if q == nil || count <= 0 {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pruneLocked(time.Now())
+	if len(q.items) == 0 {
+		return nil
+	}
+	if count > len(q.items) {
+		count = len(q.items)
+	}
+	out := make([][]byte, 0, count)
+	// items are oldest->newest; take from end
+	for i := len(q.items) - 1; i >= 0 && len(out) < count; i-- {
+		payload := append([]byte(nil), q.items[i].payload...)
+		out = append(out, payload)
+	}
+	return out
+}
+
 func SubscribeUsage() (<-chan []byte, func()) {
 	return global.subscribe(usageSubscriberBuffer, []byte(usageSupportRefreshPayload))
 }

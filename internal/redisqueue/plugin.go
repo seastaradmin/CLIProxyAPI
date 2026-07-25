@@ -105,7 +105,10 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		ExecutorType:        executorType,
 		Model:               modelName,
 		Alias:               aliasName,
-		Endpoint:            resolveEndpoint(ctx),
+		Endpoint:            firstNonEmpty(resolveEndpoint(ctx), inferEndpointFromURL(record)),
+		BaseURL:             strings.TrimSpace(record.BaseURL),
+		Protocol:            firstNonEmpty(strings.TrimSpace(record.Protocol), inferProtocolFromEndpoint(firstNonEmpty(resolveEndpoint(ctx), inferEndpointFromURL(record)))),
+		Supplier:            strings.TrimSpace(record.Supplier),
 		AuthType:            authType,
 		APIKey:              apiKey,
 		RequestID:           requestID,
@@ -127,6 +130,9 @@ type queuedUsageDetail struct {
 	Model               string `json:"model"`
 	Alias               string `json:"alias"`
 	Endpoint            string `json:"endpoint"`
+	BaseURL             string `json:"base_url"`
+	Protocol            string `json:"protocol"`
+	Supplier            string `json:"supplier,omitempty"`
 	AuthType            string `json:"auth_type"`
 	APIKey              string `json:"api_key"`
 	RequestID           string `json:"request_id"`
@@ -193,3 +199,29 @@ func resolveEndpoint(ctx context.Context) string {
 }
 
 const httpStatusBadRequest = 400
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func inferProtocolFromEndpoint(endpoint string) string {
+	e := strings.ToLower(endpoint)
+	switch {
+	case strings.Contains(e, "/messages"):
+		return "messages"
+	case strings.Contains(e, "/responses"):
+		return "responses"
+	case strings.Contains(e, "/chat/completions"):
+		return "chat"
+	default:
+		return ""
+	}
+}
+
+// inferEndpointFromURL is a placeholder; URL is not on Record. Keep empty.
+func inferEndpointFromURL(_ coreusage.Record) string { return "" }

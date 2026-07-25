@@ -53,3 +53,30 @@ func parseUsageQueueCount(value string) (int, error) {
 	}
 	return count, nil
 }
+
+// GetUsageRecent returns recent usage records newest-first without consuming the queue.
+// Query: count (default 50, max 200)
+func (h *Handler) GetUsageRecent(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return
+	}
+	count := 50
+	if raw := strings.TrimSpace(c.Query("count")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "count must be a positive integer"})
+			return
+		}
+		count = n
+	}
+	if count > 200 {
+		count = 200
+	}
+	items := redisqueue.SnapshotNewest(count)
+	records := make([]usageQueueRecord, 0, len(items))
+	for _, item := range items {
+		records = append(records, usageQueueRecord(append([]byte(nil), item...)))
+	}
+	c.JSON(http.StatusOK, gin.H{"records": records, "count": len(records)})
+}

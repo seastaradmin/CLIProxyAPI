@@ -1714,11 +1714,63 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+func logStreamBootstrapFailure(ctx context.Context, auth *Auth, provider, model string, timeout time.Duration, err error) {
+	if err == nil {
+		return
+	}
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	code := ""
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		code = strings.TrimSpace(authErr.Code)
+	}
+	fields := log.Fields{
+		"phase":    "stream_bootstrap",
+		"provider": strings.TrimSpace(provider),
+		"model":    strings.TrimSpace(model),
+		"auth":     authID,
+		"timeout":  timeout.String(),
+		"error":    err.Error(),
+	}
+	if reqID := strings.TrimSpace(logging.GetRequestID(ctx)); reqID != "" {
+		fields["request_id"] = reqID
+	}
+	if code != "" {
+		fields["error_class"] = code
+	}
+	log.WithFields(fields).Warn("stream bootstrap failed before first payload")
+}
+
+func (m *Manager) firstChunkTimeout() time.Duration {
+	if m == nil {
+		return internalconfig.ResolveFirstChunkTimeout(0)
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return internalconfig.ResolveFirstChunkTimeout(0)
+	}
+	return internalconfig.ResolveFirstChunkTimeout(cfg.Streaming.FirstChunkTimeoutSeconds)
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
+	return readStreamBootstrapWithTimeout(ctx, ch, 0)
+}
+
+func readStreamBootstrapWithTimeout(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, timeout time.Duration) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	var timeoutC <-chan time.Time
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		timeoutC = timer.C
+		defer timer.Stop()
+	}
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -1728,6 +1780,24 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 			select {
 			case <-ctx.Done():
 				return nil, false, ctx.Err()
+			case <-timeoutC:
+				return nil, false, &Error{
+					Code:       "first_chunk_timeout",
+					Message:    fmt.Sprintf("upstream stream produced no payload within %s", timeout),
+					Retryable:  true,
+					HTTPStatus: http.StatusGatewayTimeout,
+				}
+			case chunk, ok = <-ch:
+			}
+		} else if timeoutC != nil {
+			select {
+			case <-timeoutC:
+				return nil, false, &Error{
+					Code:       "first_chunk_timeout",
+					Message:    fmt.Sprintf("upstream stream produced no payload within %s", timeout),
+					Retryable:  true,
+					HTTPStatus: http.StatusGatewayTimeout,
+				}
 			case chunk, ok = <-ch:
 			}
 		} else {
@@ -1743,6 +1813,8 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 		if len(chunk.Payload) > 0 {
 			return buffered, false, nil
 		}
+		// Empty keep-alive / control frames do not count as first payload; keep waiting
+		// under the same overall first-chunk deadline.
 	}
 }
 
@@ -1873,7 +1945,8 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
-		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+		firstChunkTimeout := m.firstChunkTimeout()
+		buffered, closed, bootstrapErr := readStreamBootstrapWithTimeout(ctx, streamResult.Chunks, firstChunkTimeout)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
@@ -1892,11 +1965,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					streamResult = &cliproxyexecutor.StreamResult{}
 				} else {
 					streamResult = retryStream
-					buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
+					buffered, closed, bootstrapErr = readStreamBootstrapWithTimeout(ctx, streamResult.Chunks, firstChunkTimeout)
 				}
 			}
 		}
 		if bootstrapErr != nil {
+			logStreamBootstrapFailure(ctx, auth, provider, resultModel, firstChunkTimeout, bootstrapErr)
 			if isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
@@ -2561,8 +2635,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			entry.Warnf("selected auth has no executable upstream models after alias/pool filtering provider=%s auth_id=%s auth_index=%s route_model=%s",
+				strings.TrimSpace(provider), strings.TrimSpace(auth.ID), strings.TrimSpace(auth.EnsureIndex()), strings.TrimSpace(routeModel))
 			continue
 		}
+		logExecutionModelDecision(entry, auth, provider, routeModel, models, pooled, aliasResult)
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
@@ -2680,8 +2757,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			entry.Warnf("selected auth has no executable upstream models after alias/pool filtering provider=%s auth_id=%s auth_index=%s route_model=%s",
+				strings.TrimSpace(provider), strings.TrimSpace(auth.ID), strings.TrimSpace(auth.EnsureIndex()), strings.TrimSpace(routeModel))
 			continue
 		}
+		logExecutionModelDecision(entry, auth, provider, routeModel, models, pooled, aliasResult)
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
@@ -2797,8 +2877,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if len(models) == 0 {
+			entry.Warnf("selected auth has no executable upstream models after alias/pool filtering provider=%s auth_id=%s auth_index=%s route_model=%s",
+				strings.TrimSpace(provider), strings.TrimSpace(auth.ID), strings.TrimSpace(auth.EnsureIndex()), strings.TrimSpace(routeModel))
 			continue
 		}
+		logExecutionModelDecision(entry, auth, provider, routeModel, models, pooled, aliasResult)
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
@@ -5994,25 +6077,85 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 }
 
 func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model string) {
-	if !log.IsLevelEnabled(log.DebugLevel) {
-		return
-	}
 	if entry == nil || auth == nil {
 		return
 	}
 	accountType, accountInfo := auth.AccountInfo()
 	proxyInfo := auth.ProxyInfo()
-	suffix := ""
+	parts := []string{
+		fmt.Sprintf("provider=%s", strings.TrimSpace(provider)),
+		fmt.Sprintf("auth_id=%s", strings.TrimSpace(auth.ID)),
+		fmt.Sprintf("auth_index=%s", strings.TrimSpace(auth.EnsureIndex())),
+		fmt.Sprintf("auth_label=%s", strings.TrimSpace(auth.Label)),
+		fmt.Sprintf("auth_kind=%s", strings.TrimSpace(auth.AuthKind())),
+		fmt.Sprintf("route_model=%s", strings.TrimSpace(model)),
+		fmt.Sprintf("account_type=%s", accountType),
+	}
+	if auth.Attributes != nil {
+		if baseURL := strings.TrimSpace(auth.Attributes["base_url"]); baseURL != "" {
+			parts = append(parts, "base_url="+baseURL)
+		}
+		if compatName := strings.TrimSpace(auth.Attributes["compat_name"]); compatName != "" {
+			parts = append(parts, "compat_name="+compatName)
+		}
+		if excluded := strings.TrimSpace(auth.Attributes["excluded_models"]); excluded != "" {
+			parts = append(parts, "excluded_models="+excluded)
+		}
+	}
 	if proxyInfo != "" {
-		suffix = " " + proxyInfo
+		parts = append(parts, "proxy="+proxyInfo)
 	}
 	switch accountType {
 	case "api_key":
-		entry.Debugf("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
+		parts = append(parts, "account="+util.HideAPIKey(accountInfo))
 	case "oauth":
-		ident := formatOauthIdentity(auth, provider, accountInfo)
-		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
+		parts = append(parts, "account="+formatOauthIdentity(auth, provider, accountInfo))
+	default:
+		if accountInfo != "" {
+			parts = append(parts, "account="+accountInfo)
+		}
 	}
+	// Custom formatter only prints whitelist fields; keep diagnostics in the message.
+	entry.Infof("auth selected for route model %s", strings.Join(parts, " "))
+	if log.IsLevelEnabled(log.DebugLevel) {
+		switch accountType {
+		case "api_key":
+			entry.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), model)
+		case "oauth":
+			entry.Debugf("Use OAuth %s for model %s", formatOauthIdentity(auth, provider, accountInfo), model)
+		}
+	}
+}
+
+func logExecutionModelDecision(entry *log.Entry, auth *Auth, provider, routeModel string, upstreamModels []string, pooled bool, aliasResult OAuthModelAliasResult) {
+	if entry == nil || auth == nil {
+		return
+	}
+	parts := []string{
+		fmt.Sprintf("provider=%s", strings.TrimSpace(provider)),
+		fmt.Sprintf("auth_id=%s", strings.TrimSpace(auth.ID)),
+		fmt.Sprintf("auth_index=%s", strings.TrimSpace(auth.EnsureIndex())),
+		fmt.Sprintf("auth_label=%s", strings.TrimSpace(auth.Label)),
+		fmt.Sprintf("route_model=%s", strings.TrimSpace(routeModel)),
+		fmt.Sprintf("upstream_models=%s", strings.Join(upstreamModels, ",")),
+		fmt.Sprintf("pooled=%v", pooled),
+	}
+	if auth.Attributes != nil {
+		if baseURL := strings.TrimSpace(auth.Attributes["base_url"]); baseURL != "" {
+			parts = append(parts, "base_url="+baseURL)
+		}
+		if compatName := strings.TrimSpace(auth.Attributes["compat_name"]); compatName != "" {
+			parts = append(parts, "compat_name="+compatName)
+		}
+	}
+	if aliasResult.UpstreamModel != "" {
+		parts = append(parts, "alias_upstream="+aliasResult.UpstreamModel)
+		parts = append(parts, fmt.Sprintf("alias_force_mapping=%v", aliasResult.ForceMapping))
+		if aliasResult.OriginalAlias != "" {
+			parts = append(parts, "alias_original="+aliasResult.OriginalAlias)
+		}
+	}
+	entry.Infof("execution model resolved %s", strings.Join(parts, " "))
 }
 
 func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {

@@ -18,7 +18,7 @@ const (
 	// ClientID is the public xAI Grok CLI OAuth client ID.
 	ClientID = "b1a00492-073a-47ea-816f-4c329264a828"
 	// Scope is the OAuth scope set required for xAI API access.
-	Scope = "openid profile email offline_access grok-cli:access api:access"
+	Scope = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write"
 	// DeviceCodeGrantType is the OAuth2 device authorization grant type (RFC 8628).
 	DeviceCodeGrantType = "urn:ietf:params:oauth:grant-type:device_code"
 	// defaultPollInterval is used when the device endpoint omits interval.

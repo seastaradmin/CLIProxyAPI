@@ -65,7 +65,7 @@ const (
 	xaiTokenAuthValue           = "xai-grok-cli"
 	xaiClientVersionHeader      = "x-grok-client-version"
 	// Keep in sync with the current Grok CLI client version that chat-proxy expects.
-	xaiClientVersionValue = "0.2.93"
+	xaiClientVersionValue = "0.2.99"
 	// xaiUsingAPIAttr enables the official API path for non-media HTTP chat.
 	xaiUsingAPIAttr = "using_api"
 )
@@ -170,6 +170,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		logXAIUpstreamRequestFailure(ctx, httpResp.StatusCode, data, prepared, req, opts)
 		return resp, xaiStatusErr(httpResp.StatusCode, data)
 	}
 
@@ -622,6 +623,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		logXAIUpstreamRequestFailure(ctx, httpResp.StatusCode, data, prepared, req, opts)
 		return nil, xaiStatusErr(httpResp.StatusCode, data)
 	}
 
@@ -846,6 +848,9 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
+	// Codex may embed tools as input[].type=additional_tools. xAI ModelInput rejects that.
+	// Hoist nested tools to top-level tools and drop the unsupported input item.
+	body = hoistXAIAdditionalToolsFromInput(body)
 	body = normalizeXAITools(body)
 	body = normalizeXAIToolChoiceForTools(body)
 	var replayScope xaiReasoningReplayScope
@@ -1120,6 +1125,102 @@ func xaiMetadataString(meta map[string]any, key string) string {
 	}
 }
 
+func logXAIUpstreamRequestFailure(ctx context.Context, statusCode int, errBody []byte, prepared *xaiPreparedRequest, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) {
+	// Custom log formatter only prints a small field whitelist, so put diagnostics in the message.
+	parts := []string{
+		fmt.Sprintf("status=%d", statusCode),
+		fmt.Sprintf("route_model=%s", strings.TrimSpace(req.Model)),
+		fmt.Sprintf("upstream_error=%s", helps.SummarizeErrorBody("application/json", errBody)),
+	}
+	appendPart := func(k string, v any) {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+	}
+	if prepared != nil {
+		appendPart("upstream_model", strings.TrimSpace(prepared.baseModel))
+		appendPart("from_format", prepared.from.String())
+		appendPart("to_format", prepared.to.String())
+		appendPart("response_format", prepared.responseFormat.String())
+		appendPart("session_id", strings.TrimSpace(prepared.sessionID))
+		appendPart("body_bytes", len(prepared.body))
+		if len(prepared.body) > 0 {
+			appendPart("body_model", gjson.GetBytes(prepared.body, "model").String())
+			appendPart("has_tools", gjson.GetBytes(prepared.body, "tools").Exists())
+			appendPart("tools_count", len(gjson.GetBytes(prepared.body, "tools").Array()))
+			appendPart("has_reasoning", gjson.GetBytes(prepared.body, "reasoning").Exists())
+			appendPart("reasoning_effort", gjson.GetBytes(prepared.body, "reasoning.effort").String())
+			appendPart("has_instructions", gjson.GetBytes(prepared.body, "instructions").Exists())
+			appendPart("stream", gjson.GetBytes(prepared.body, "stream").Bool())
+			appendPart("has_previous_response_id", gjson.GetBytes(prepared.body, "previous_response_id").Exists())
+			appendPart("has_prompt_cache_key", gjson.GetBytes(prepared.body, "prompt_cache_key").Exists())
+			input := gjson.GetBytes(prepared.body, "input")
+			appendPart("input_type", input.Type.String())
+			if input.IsArray() {
+				arr := input.Array()
+				appendPart("input_len", len(arr))
+				typeCounts := map[string]int{}
+				roles := map[string]int{}
+				for _, item := range arr {
+					if !item.IsObject() {
+						typeCounts["non_object"]++
+						continue
+					}
+					itemType := strings.TrimSpace(item.Get("type").String())
+					if itemType == "" {
+						itemType = "missing_type"
+					}
+					typeCounts[itemType]++
+					if role := strings.TrimSpace(item.Get("role").String()); role != "" {
+						roles[role]++
+					}
+				}
+				typeParts := make([]string, 0, len(typeCounts))
+				for k, v := range typeCounts {
+					typeParts = append(typeParts, fmt.Sprintf("%s=%d", k, v))
+				}
+				sort.Strings(typeParts)
+				appendPart("input_item_types", strings.Join(typeParts, ","))
+				if len(roles) > 0 {
+					roleParts := make([]string, 0, len(roles))
+					for k, v := range roles {
+						roleParts = append(roleParts, fmt.Sprintf("%s=%d", k, v))
+					}
+					sort.Strings(roleParts)
+					appendPart("input_roles", strings.Join(roleParts, ","))
+				}
+				if len(arr) > 0 {
+					first := arr[0]
+					appendPart("input_first_type", strings.TrimSpace(first.Get("type").String()))
+					appendPart("input_first_role", strings.TrimSpace(first.Get("role").String()))
+					if content := first.Get("content"); content.Exists() {
+						appendPart("input_first_content_type", content.Type.String())
+					}
+				}
+			} else if input.Type == gjson.String {
+				appendPart("input_len", len(input.String()))
+			} else if input.Exists() {
+				appendPart("input_raw_kind", input.Type.String())
+			} else {
+				appendPart("input_missing", true)
+			}
+			if parsed := gjson.ParseBytes(prepared.body); parsed.IsObject() {
+				keys := make([]string, 0, 16)
+				parsed.ForEach(func(key, _ gjson.Result) bool {
+					keys = append(keys, key.String())
+					return len(keys) < 32
+				})
+				sort.Strings(keys)
+				appendPart("body_keys", strings.Join(keys, ","))
+			}
+		}
+	} else {
+		appendPart("upstream_model", strings.TrimSpace(thinking.ParseSuffix(req.Model).ModelName))
+	}
+	if requested := helps.PayloadRequestedModel(opts, req.Model); requested != "" {
+		appendPart("requested_model", requested)
+	}
+	helps.LogWithRequestID(ctx).Warnf("xai upstream request failed %s", strings.Join(parts, " "))
+}
+
 func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	body = removeXAIEncryptedReasoningInclude(body)
 	if !xaiSupportsReasoningEffort(model) {
@@ -1132,6 +1233,75 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 		}
 	}
 	return body
+}
+
+// hoistXAIAdditionalToolsFromInput moves Codex "additional_tools" input items into the
+// top-level tools array and removes those input items. xAI Responses rejects
+// input item type "additional_tools" with ModelInput deserialization errors.
+func hoistXAIAdditionalToolsFromInput(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+
+	keptInput := make([]json.RawMessage, 0, len(input.Array()))
+	hoistedTools := make([]json.RawMessage, 0)
+	changed := false
+	for _, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if !strings.EqualFold(itemType, "additional_tools") {
+			keptInput = append(keptInput, json.RawMessage(item.Raw))
+			continue
+		}
+		changed = true
+		tools := item.Get("tools")
+		if tools.Exists() && tools.IsArray() {
+			for _, tool := range tools.Array() {
+				if strings.TrimSpace(tool.Raw) == "" || tool.Raw == "null" {
+					continue
+				}
+				hoistedTools = append(hoistedTools, json.RawMessage(tool.Raw))
+			}
+		}
+	}
+	if !changed {
+		return body
+	}
+
+	rawInput, errMarshal := json.Marshal(keptInput)
+	if errMarshal != nil {
+		return body
+	}
+	updated, errSet := sjson.SetRawBytes(body, "input", rawInput)
+	if errSet != nil {
+		return body
+	}
+
+	if len(hoistedTools) == 0 {
+		return updated
+	}
+
+	// Merge into existing top-level tools if present.
+	existing := gjson.GetBytes(updated, "tools")
+	merged := make([]json.RawMessage, 0)
+	if existing.Exists() && existing.IsArray() {
+		for _, tool := range existing.Array() {
+			if strings.TrimSpace(tool.Raw) == "" || tool.Raw == "null" {
+				continue
+			}
+			merged = append(merged, json.RawMessage(tool.Raw))
+		}
+	}
+	merged = append(merged, hoistedTools...)
+	rawTools, errMarshal := json.Marshal(merged)
+	if errMarshal != nil {
+		return updated
+	}
+	withTools, errSet := sjson.SetRawBytes(updated, "tools", rawTools)
+	if errSet != nil {
+		return updated
+	}
+	return withTools
 }
 
 func normalizeXAITools(body []byte) []byte {

@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/requestjournal"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
@@ -1620,6 +1621,18 @@ func (s *Service) Run(ctx context.Context) error {
 		forceHomeRuntimeConfig(s.cfg)
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
+	// Enable in-memory usage queue for management "usage-recent" whenever statistics are on.
+	// Previously only home mode called SetEnabled(true), so standalone always returned empty logs.
+	if s.cfg != nil && s.cfg.UsageStatisticsEnabled {
+		redisqueue.SetUsageStatisticsEnabled(true)
+		redisqueue.SetEnabled(true)
+		redisqueue.SetRetentionSeconds(s.cfg.RedisUsageQueueRetentionSeconds)
+	}
+	if s.cfg != nil && s.cfg.UsageStatisticsEnabled {
+		// Durable request journal for management UI (hard-deletable).
+		requestjournal.Enable(logging.ResolveLogDirectory(s.cfg), 30)
+		go requestjournal.PruneOld()
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -1982,8 +1995,14 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = registry.GetAIStudioModels()
 		models = applyExcludedModels(models, excluded)
 	case "antigravity":
-		models = registry.GetAntigravityModels()
-		models = applyAntigravityFetchedModelCapabilities(models, s.fetchAntigravityModelCapabilityHintsForAuth(ctx, a))
+		staticModels := registry.GetAntigravityModels()
+		fetched := s.fetchAntigravityModelsForAuth(ctx, a)
+		if fetched.AuthoritativeList {
+			models = mergeAntigravityFetchedModels(staticModels, fetched.Models)
+			models = applyAntigravityFetchedModelCapabilities(models, fetched.CapabilityHints)
+		} else {
+			models = staticModels
+		}
 		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
@@ -2075,12 +2094,18 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 				if providerKey == "" {
 					providerKey = "openai-compatibility"
 				}
-				ms := cached.models
+				// Prefer per-key model resolution so api-key-entries can override models.
+				ms, okModels := s.resolveOpenAICompatibilityModelsForAuth(a, compatName)
+				if !okModels {
+					ms = cached.models
+				}
+				ms = applyExcludedModels(ms, excluded)
 				if len(ms) > 0 {
 					ms = s.appendPluginModels(providerKey, ms)
 					s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 				} else {
 					ms = s.appendPluginModels(providerKey, nil)
+					ms = applyExcludedModels(ms, excluded)
 					if len(ms) > 0 {
 						s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 					} else {
@@ -2096,8 +2121,13 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 				}
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
-					ms := buildOpenAICompatibilityConfigModels(compat)
-					// Register and return
+					ms, _ := s.resolveOpenAICompatibilityModelsForAuth(a, compatName)
+					if ms == nil {
+						ms = buildOpenAICompatibilityConfigModels(compat)
+					}
+					// Register and return. Apply excluded-models before registry binding so
+					// disabled credential×model routes are actually unroutable.
+					ms = applyExcludedModels(ms, excluded)
 					if len(ms) > 0 {
 						if providerKey == "" {
 							providerKey = "openai-compatibility"
@@ -2107,6 +2137,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 					} else {
 						// Ensure stale registrations are cleared when model list becomes empty.
 						ms = s.appendPluginModels(providerKey, nil)
+						ms = applyExcludedModels(ms, excluded)
 						if len(ms) > 0 {
 							s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 						} else {
@@ -2118,6 +2149,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			}
 			if isCompatAuth {
 				models = s.appendPluginModels(providerKey, nil)
+				models = applyExcludedModels(models, excluded)
 				if len(models) > 0 {
 					s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 				} else {
@@ -2368,11 +2400,23 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		if model == nil {
 			continue
 		}
-		modelID := strings.ToLower(strings.TrimSpace(model.ID))
+		candidates := []string{
+			strings.ToLower(strings.TrimSpace(model.ID)),
+			strings.ToLower(strings.TrimSpace(model.Name)),
+			strings.ToLower(strings.TrimSpace(model.DisplayName)),
+		}
 		blocked := false
 		for _, pattern := range patterns {
-			if matchWildcard(pattern, modelID) {
-				blocked = true
+			for _, candidate := range candidates {
+				if candidate == "" {
+					continue
+				}
+				if matchWildcard(pattern, candidate) {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
 				break
 			}
 		}
@@ -2474,17 +2518,68 @@ type modelEntry interface {
 	GetAlias() string
 }
 
+// buildOpenAICompatibilityModelsList builds ModelInfo from an explicit model slice
+// (provider-level or per-key override). ownedBy is used for OwnedBy display.
+func buildOpenAICompatibilityModelsList(models []config.OpenAICompatibilityModel, ownedBy string) []*ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	tmp := &config.OpenAICompatibility{Name: ownedBy, Models: models}
+	return buildOpenAICompatibilityConfigModels(tmp)
+}
+
+// resolveOpenAICompatibilityModelsForAuth returns the effective model list for one
+// openai-compat auth: per-key models when configured, otherwise the provider list.
+func (s *Service) resolveOpenAICompatibilityModelsForAuth(a *coreauth.Auth, compatName string) ([]*ModelInfo, bool) {
+	if s == nil || s.cfg == nil || a == nil {
+		return nil, false
+	}
+	compatName = strings.TrimSpace(compatName)
+	apiKey := ""
+	if a.Attributes != nil {
+		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+	}
+	for i := range s.cfg.OpenAICompatibility {
+		compat := &s.cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(compat.Name), compatName) {
+			continue
+		}
+		// Prefer matching API key entry with per-key models.
+		if apiKey != "" {
+			for j := range compat.APIKeyEntries {
+				entry := &compat.APIKeyEntries[j]
+				if strings.TrimSpace(entry.APIKey) != apiKey {
+					continue
+				}
+				if len(entry.Models) > 0 {
+					return buildOpenAICompatibilityModelsList(entry.Models, compat.Name), true
+				}
+				// Key found but no override → inherit provider models.
+				return buildOpenAICompatibilityConfigModels(compat), true
+			}
+		}
+		return buildOpenAICompatibilityConfigModels(compat), true
+	}
+	return nil, false
+}
+
 func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []*ModelInfo {
 	if compat == nil || len(compat.Models) == 0 {
 		return nil
 	}
 	now := time.Now().Unix()
 	models := make([]*ModelInfo, 0, len(compat.Models))
+	seen := make(map[string]struct{}, len(compat.Models))
 	for i := range compat.Models {
 		model := compat.Models[i]
-		modelID := strings.TrimSpace(model.Alias)
+		alias := strings.TrimSpace(model.Alias)
+		name := strings.TrimSpace(model.Name)
+		modelID := alias
 		if modelID == "" {
-			modelID = strings.TrimSpace(model.Name)
+			modelID = name
 		}
 		if modelID == "" {
 			continue
@@ -2499,18 +2594,31 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		}
 		inputModalities := normalizeCompatConfigModalities(model.InputModalities)
 		outputModalities := normalizeCompatConfigModalities(model.OutputModalities)
-		models = append(models, &ModelInfo{
-			ID:                        modelID,
-			Object:                    "model",
-			Created:                   now,
-			OwnedBy:                   compat.Name,
-			Type:                      modelType,
-			DisplayName:               modelID,
-			UserDefined:               false,
-			Thinking:                  thinking,
-			SupportedInputModalities:  inputModalities,
-			SupportedOutputModalities: outputModalities,
-		})
+		routeIDs := []string{modelID}
+		// Fork keeps the upstream name routable alongside the alias.
+		if model.Fork && alias != "" && name != "" && !strings.EqualFold(alias, name) {
+			routeIDs = append(routeIDs, name)
+		}
+		for _, routeID := range routeIDs {
+			key := strings.ToLower(routeID)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			models = append(models, &ModelInfo{
+				ID:                        routeID,
+				Object:                    "model",
+				Created:                   now,
+				OwnedBy:                   compat.Name,
+				Type:                      modelType,
+				DisplayName:               routeID,
+				Name:                      name,
+				UserDefined:               false,
+				Thinking:                  thinking,
+				SupportedInputModalities:  inputModalities,
+				SupportedOutputModalities: outputModalities,
+			})
+		}
 	}
 	return models
 }

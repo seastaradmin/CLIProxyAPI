@@ -82,6 +82,272 @@ func (e *OpenAICompatExecutor) HttpRequest(ctx context.Context, auth *cliproxyau
 	return httpClient.Do(httpReq)
 }
 
+// RequestToFormat selects the upstream protocol for openai-compatible channels.
+// When the channel declares native support for the client protocol, it is used
+// as a passthrough target; otherwise chat completions remains the default.
+func (e *OpenAICompatExecutor) RequestToFormat(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
+	if opts.Alt == "responses/compact" && !opts.Stream {
+		return sdktranslator.FromString("openai-response")
+	}
+	// Auth is not available at this stage; channel-level defaults come from empty auth.
+	return e.openAICompatUpstreamFormat(nil, req, opts)
+}
+
+func (e *OpenAICompatExecutor) openAICompatUpstreamFormat(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
+	if opts.Alt == "responses/compact" && !opts.Stream {
+		return sdktranslator.FromString("openai-response")
+	}
+	protocols := e.openAICompatProtocols(auth, req, opts)
+	clientProto := util.ClientFormatToProtocol(opts.SourceFormat.String())
+	if clientProto != "" && util.HasProtocol(protocols, clientProto) {
+		switch clientProto {
+		case "responses":
+			return sdktranslator.FromString("openai-response")
+		case "messages":
+			return sdktranslator.FromString("claude")
+		case "chat":
+			return sdktranslator.FromString("openai")
+		}
+	}
+	// Default / fallback: chat completions.
+	return sdktranslator.FromString("openai")
+}
+
+func (e *OpenAICompatExecutor) openAICompatProtocols(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) []string {
+	// Model-level protocols from openai-compatibility config take precedence
+	// over the channel-level attribute stamped by the synthesizer. Per-key
+	// model lists are scoped to the key entry owning this auth.
+	if e != nil && e.cfg != nil && auth != nil {
+		compatName := ""
+		providerKey := ""
+		baseURL := ""
+		authAPIKey := ""
+		if auth.Attributes != nil {
+			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
+			providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
+			baseURL = strings.TrimRight(strings.TrimSpace(auth.Attributes["base_url"]), "/")
+			authAPIKey = strings.TrimSpace(auth.Attributes["api_key"])
+		}
+		if compatName == "" {
+			compatName = strings.TrimSpace(auth.Label)
+		}
+		modelName := thinking.ParseSuffix(req.Model).ModelName
+		matchModelProtocols := func(list []config.OpenAICompatibilityModel) []string {
+			for j := range list {
+				m := &list[j]
+				alias := strings.TrimSpace(m.Alias)
+				actual := strings.TrimSpace(m.Name)
+				matched := (actual != "" && (strings.EqualFold(actual, modelName) || strings.EqualFold(actual, req.Model))) ||
+					(alias != "" && (strings.EqualFold(alias, modelName) || strings.EqualFold(alias, req.Model)))
+				if matched && len(m.Protocols) > 0 {
+					return util.NormalizeUpstreamProtocols(m.Protocols)
+				}
+			}
+			return nil
+		}
+		type cand struct {
+			protocols []string
+			base      string
+		}
+		var candidates []cand
+		for i := range e.cfg.OpenAICompatibility {
+			compat := &e.cfg.OpenAICompatibility[i]
+			if compat.Disabled {
+				continue
+			}
+			name := strings.TrimSpace(compat.Name)
+			if name == "" {
+				continue
+			}
+			match := strings.EqualFold(name, compatName)
+			if !match && providerKey != "" {
+				match = strings.EqualFold(util.OpenAICompatibleProviderKey(strings.ToLower(name)), providerKey)
+			}
+			if !match {
+				continue
+			}
+			// Per-model override: the key entry owning this auth first, then
+			// the provider-level list, then any other key entry list.
+			protos := []string(nil)
+			if authAPIKey != "" {
+				for k := range compat.APIKeyEntries {
+					if strings.TrimSpace(compat.APIKeyEntries[k].APIKey) == authAPIKey {
+						protos = matchModelProtocols(compat.APIKeyEntries[k].Models)
+						break
+					}
+				}
+			}
+			if protos == nil {
+				protos = matchModelProtocols(compat.Models)
+			}
+			if protos == nil {
+				for k := range compat.APIKeyEntries {
+					if p := matchModelProtocols(compat.APIKeyEntries[k].Models); p != nil {
+						protos = p
+						break
+					}
+				}
+			}
+			if protos == nil && len(compat.Protocols) > 0 {
+				protos = util.NormalizeUpstreamProtocols(compat.Protocols)
+				log.Debugf("openai-compat: model %q using provider-level protocols %v (consider running protocol-probe-batch to set per-model protocols)", modelName, protos)
+			}
+			candidates = append(candidates, cand{protocols: protos, base: strings.TrimRight(strings.TrimSpace(compat.BaseURL), "/")})
+		}
+		if baseURL != "" {
+			for _, c := range candidates {
+				if c.base == "" {
+					continue
+				}
+				if strings.EqualFold(c.base, baseURL) ||
+					strings.HasPrefix(strings.ToLower(baseURL), strings.ToLower(c.base)) ||
+					strings.HasPrefix(strings.ToLower(c.base), strings.ToLower(baseURL)) {
+					if len(c.protocols) > 0 {
+						return c.protocols
+					}
+					break
+				}
+			}
+		}
+		if len(candidates) == 1 && len(candidates[0].protocols) > 0 {
+			return candidates[0].protocols
+		}
+	}
+	// Channel-level fallback: attribute stamped by the synthesizer
+	// (a copy of the provider-level protocols set).
+	if auth != nil && auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["protocols"]); raw != "" {
+			return util.ParseProtocolsCSV(raw)
+		}
+	}
+	return []string{"chat"}
+}
+
+func applyOpenAICompatAuthHeaders(httpReq *http.Request, apiKey string, to sdktranslator.Format) {
+	if httpReq == nil {
+		return
+	}
+	if to.String() == "claude" {
+		if apiKey != "" {
+			httpReq.Header.Set("x-api-key", apiKey)
+			// Some Anthropic-compatible gateways also accept Bearer.
+			if httpReq.Header.Get("Authorization") == "" {
+				httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+			}
+		}
+		if httpReq.Header.Get("anthropic-version") == "" {
+			httpReq.Header.Set("anthropic-version", "2023-06-01")
+		}
+		return
+	}
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+}
+
+func protocolLabelFromFormat(to sdktranslator.Format) string {
+	switch to.String() {
+	case "openai-response":
+		return "responses"
+	case "claude":
+		return "messages"
+	default:
+		return "chat"
+	}
+}
+
+func openAICompatEndpoint(to sdktranslator.Format, alt string) string {
+	if alt == "responses/compact" {
+		return "/responses/compact"
+	}
+	switch to.String() {
+	case "openai-response":
+		return "/responses"
+	case "claude":
+		return "/messages"
+	default:
+		return "/chat/completions"
+	}
+}
+
+// openAICompatEndpointResolved returns the endpoint path for the given protocol,
+// preferring a stored protocol-endpoint from config (populated by protocol-probe-batch).
+// Falls back to the standard openAICompatEndpoint logic when no stored path exists.
+func (e *OpenAICompatExecutor) openAICompatEndpointResolved(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, to sdktranslator.Format, alt string) string {
+	if alt == "responses/compact" {
+		return "/responses/compact"
+	}
+	protoLabel := protocolLabelFromFormat(to)
+	if protoLabel == "chat" {
+		return "/chat/completions"
+	}
+	// Check config for stored endpoint path.
+	if e != nil && e.cfg != nil && auth != nil {
+		modelName := thinking.ParseSuffix(req.Model).ModelName
+		compatName := ""
+		baseURL := ""
+		authAPIKey := ""
+		if auth.Attributes != nil {
+			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
+			baseURL = strings.TrimRight(strings.TrimSpace(auth.Attributes["base_url"]), "/")
+			authAPIKey = strings.TrimSpace(auth.Attributes["api_key"])
+		}
+		if compatName == "" {
+			compatName = strings.TrimSpace(auth.Label)
+		}
+		matchStoredEndpoint := func(list []config.OpenAICompatibilityModel) string {
+			for j := range list {
+				m := &list[j]
+				actual := strings.TrimSpace(m.Name)
+				if actual != "" && strings.EqualFold(actual, modelName) {
+					if ep, ok := m.ProtocolEndpoints[protoLabel]; ok && ep != "" {
+						return ep
+					}
+				}
+			}
+			return ""
+		}
+		for i := range e.cfg.OpenAICompatibility {
+			compat := &e.cfg.OpenAICompatibility[i]
+			if compat.Disabled {
+				continue
+			}
+			name := strings.TrimSpace(compat.Name)
+			if !strings.EqualFold(name, compatName) {
+				continue
+			}
+			if baseURL != "" {
+				entryBase := strings.TrimRight(strings.TrimSpace(compat.BaseURL), "/")
+				if !strings.EqualFold(entryBase, baseURL) && !strings.HasPrefix(strings.ToLower(baseURL), strings.ToLower(entryBase)) && !strings.HasPrefix(strings.ToLower(entryBase), strings.ToLower(baseURL)) {
+					continue
+				}
+			}
+			// Stored endpoint: the key entry owning this auth first, then the
+			// provider-level list, then any other key entry list.
+			if authAPIKey != "" {
+				for k := range compat.APIKeyEntries {
+					if strings.TrimSpace(compat.APIKeyEntries[k].APIKey) == authAPIKey {
+						if ep := matchStoredEndpoint(compat.APIKeyEntries[k].Models); ep != "" {
+							return ep
+						}
+						break
+					}
+				}
+			}
+			if ep := matchStoredEndpoint(compat.Models); ep != "" {
+				return ep
+			}
+			for k := range compat.APIKeyEntries {
+				if ep := matchStoredEndpoint(compat.APIKeyEntries[k].Models); ep != "" {
+					return ep
+				}
+			}
+			break
+		}
+	}
+	return openAICompatEndpoint(to, alt)
+}
+
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImages(ctx, auth, req, opts, endpointPath)
@@ -100,12 +366,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("openai")
-	endpoint := "/chat/completions"
-	if opts.Alt == "responses/compact" {
-		to = sdktranslator.FromString("openai-response")
-		endpoint = "/responses/compact"
-	}
+	to := e.openAICompatUpstreamFormat(auth, req, opts)
+	reporter.SetUpstreamProtocol(protocolLabelFromFormat(to))
+	endpoint := e.openAICompatEndpointResolved(auth, req, to, opts.Alt)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -136,9 +399,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	}
+	applyOpenAICompatAuthHeaders(httpReq, apiKey, to)
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
 	var attrs map[string]string
 	if auth != nil {
@@ -179,7 +440,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		helps.LogWithRequestID(ctx).Warnf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -277,7 +538,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
+		helps.LogWithRequestID(ctx).Warnf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
 		err = statusErr{code: httpResp.StatusCode, msg: string(body)}
 		return resp, err
 	}
@@ -306,7 +567,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("openai")
+	to := e.openAICompatUpstreamFormat(auth, req, opts)
+	reporter.SetUpstreamProtocol(protocolLabelFromFormat(to))
+	endpoint := e.openAICompatEndpointResolved(auth, req, to, opts.Alt)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -324,20 +587,20 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 
-	// Request usage data in the final streaming chunk so that token statistics
-	// are captured even when the upstream is an OpenAI-compatible provider.
-	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	// stream_options is OpenAI chat/responses only; Anthropic messages rejects unknown fields
+	// on some gateways and must not be injected during messages passthrough.
+	if to.String() == "openai" || to.String() == "openai-response" {
+		translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	}
+	applyOpenAICompatAuthHeaders(httpReq, apiKey, to)
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
 	var attrs map[string]string
 	if auth != nil {
@@ -375,7 +638,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		helps.LogWithRequestID(ctx).Warnf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
@@ -395,9 +658,22 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		var param any
 		var streamUsage helps.StreamUsageBuffer
 		defer streamUsage.Publish(ctx, reporter)
+		// Anthropic messages SSE includes event:/id: lines that the OpenAI data:-only scanner drops.
+		// Only enable raw passthrough for true claude→claude; openai→openai still needs error detection.
+		passthroughStream := from.String() == "claude" && to.String() == "claude"
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			if passthroughStream {
+				// Preserve original framing (line + newline).
+				payload := append(append([]byte(nil), line...), '\n')
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: payload}:
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
 			streamUsage.ObserveOpenAIStream(line)
 			trimmedLine := bytes.TrimSpace(line)
 			if len(trimmedLine) == 0 {
@@ -422,7 +698,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				continue
 			}
 
-			// OpenAI-compatible streams must use SSE data lines.
+			// Cross-protocol streams use registered translators (e.g. openai→claude).
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param)
 			for i := range chunks {
 				select {
@@ -439,10 +715,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
 			}
-		} else {
+		} else if !passthroughStream {
 			// In case the upstream close the stream without a terminal [DONE] marker.
 			// Feed a synthetic done marker through the translator so pending
 			// response.completed events are still emitted exactly once.
+			// Skip for true passthrough (Anthropic messages has no [DONE]).
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
 			for i := range chunks {
 				select {
@@ -535,7 +812,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 			return nil, errRead
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, body)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
+		helps.LogWithRequestID(ctx).Warnf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
 		return nil, statusErr{code: httpResp.StatusCode, msg: string(body)}
 	}
 
@@ -581,7 +858,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
-	to := sdktranslator.FromString("openai")
+	to := e.openAICompatUpstreamFormat(auth, req, opts)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
 	modelForCounting := baseModel

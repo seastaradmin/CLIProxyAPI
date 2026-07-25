@@ -1871,3 +1871,70 @@ func testValidGrokEncryptedContent() string {
 	}
 	return base64.RawStdEncoding.EncodeToString(buf[:256])
 }
+
+func TestXAIExecutorHoistsAdditionalToolsFromInput(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.5\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	payload := []byte(`{"model":"grok-4.5","stream":true,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"reasoning":{"effort":"high"},"instructions":"sys"}`)
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	// additional_tools must not remain as an input item.
+	for i, item := range gjson.GetBytes(gotBody, "input").Array() {
+		if strings.EqualFold(item.Get("type").String(), "additional_tools") {
+			t.Fatalf("input.%d still has type=additional_tools; body=%s", i, string(gotBody))
+		}
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.role").String(); got != "user" {
+		t.Fatalf("input.0.role = %q, want user after hoisting; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "tools.0.name").String(); got != "lookup" {
+		t.Fatalf("tools.0.name = %q, want lookup; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "grok-4.5" {
+		t.Fatalf("model = %q, want grok-4.5; body=%s", got, string(gotBody))
+	}
+}
+
+func TestHoistXAIAdditionalToolsFromInputMergesExistingTools(t *testing.T) {
+	in := []byte(`{"model":"grok-4.5","tools":[{"type":"function","name":"keep_me"}],"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"lookup"}]},{"type":"message","role":"user","content":"hi"}]}`)
+	out := hoistXAIAdditionalToolsFromInput(in)
+	if gjson.GetBytes(out, "input.0.type").String() == "additional_tools" {
+		t.Fatalf("additional_tools not removed: %s", string(out))
+	}
+	names := []string{}
+	for _, tool := range gjson.GetBytes(out, "tools").Array() {
+		names = append(names, tool.Get("name").String())
+	}
+	if len(names) != 2 || names[0] != "keep_me" || names[1] != "lookup" {
+		t.Fatalf("tools names = %v, want [keep_me lookup]; body=%s", names, string(out))
+	}
+}

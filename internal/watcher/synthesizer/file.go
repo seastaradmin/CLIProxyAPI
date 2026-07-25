@@ -204,6 +204,14 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Optional operator-defined supplier/group for bulk-imported credentials.
+	if rawSupplier, ok := metadata["supplier"]; ok {
+		if supplier, isStr := rawSupplier.(string); isStr {
+			if trimmed := strings.TrimSpace(supplier); trimmed != "" {
+				a.Attributes["supplier"] = trimmed
+			}
+		}
+	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")

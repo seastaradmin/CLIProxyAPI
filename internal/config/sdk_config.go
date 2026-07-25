@@ -67,4 +67,10 @@ type StreamingConfig struct {
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// FirstChunkTimeoutSeconds limits how long bootstrap waits for the first non-empty stream payload
+	// after the upstream stream is opened. 0 means default 30s; negative disables the limit.
+	// When exceeded before any client-visible payload is produced, the attempt fails as retryable so
+	// auth rotation / bootstrap retries can switch sources instead of hanging for minutes.
+	FirstChunkTimeoutSeconds int `yaml:"first-chunk-timeout-seconds,omitempty" json:"first-chunk-timeout-seconds,omitempty"`
 }

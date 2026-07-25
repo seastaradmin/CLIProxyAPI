@@ -260,6 +260,10 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"base_url":     base,
 				"compat_name":  compat.Name,
 				"provider_key": internalProviderKey,
+				"protocols":    util.ProtocolsCSV(compat.Protocols),
+			}
+			if compat.ResponseHeaderTimeoutSeconds != 0 {
+				attrs["response_header_timeout_seconds"] = strconv.Itoa(compat.ResponseHeaderTimeoutSeconds)
 			}
 			metadata := map[string]any{}
 			if disableCooling {
@@ -271,7 +275,13 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if key != "" {
 				attrs["api_key"] = key
 			}
-			if hash := diff.ComputeOpenAICompatModelsHash(compat.Models); hash != "" {
+			// Prefer per-key models when set; otherwise inherit provider models.
+			modelsForKey := compat.Models
+			if len(entry.Models) > 0 {
+				modelsForKey = entry.Models
+				attrs["models_override"] = "1"
+			}
+			if hash := diff.ComputeOpenAICompatModelsHash(modelsForKey); hash != "" {
 				attrs["models_hash"] = hash
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
@@ -287,6 +297,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				CreatedAt:  now,
 				UpdatedAt:  now,
 			}
+			ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
 			if len(a.Metadata) == 0 {
 				a.Metadata = nil
 			}
@@ -302,6 +313,10 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"base_url":     base,
 				"compat_name":  compat.Name,
 				"provider_key": internalProviderKey,
+				"protocols":    util.ProtocolsCSV(compat.Protocols),
+			}
+			if compat.ResponseHeaderTimeoutSeconds != 0 {
+				attrs["response_header_timeout_seconds"] = strconv.Itoa(compat.ResponseHeaderTimeoutSeconds)
 			}
 			metadata := map[string]any{}
 			if disableCooling {

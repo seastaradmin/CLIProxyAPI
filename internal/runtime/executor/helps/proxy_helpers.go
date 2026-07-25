@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,10 +43,13 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
+	headerTimeout := responseHeaderTimeout(cfg, auth)
+
 	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
 		transport := buildProxyTransport(proxyURL)
 		if transport != nil {
+			applyResponseHeaderTimeout(transport, headerTimeout)
 			httpClient.Transport = transport
 			return httpClient
 		}
@@ -55,10 +59,60 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
+		httpClient.Transport = wrapRoundTripperHeaderTimeout(rt, headerTimeout)
+		return httpClient
+	}
+
+	// Default transport with first-byte timeout.
+	if headerTimeout > 0 {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		applyResponseHeaderTimeout(transport, headerTimeout)
+		httpClient.Transport = transport
 	}
 
 	return httpClient
+}
+
+func responseHeaderTimeoutFromConfig(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return config.ResolveResponseHeaderTimeout(0)
+	}
+	return config.ResolveResponseHeaderTimeout(cfg.ResponseHeaderTimeoutSeconds)
+}
+
+// responseHeaderTimeout resolves per-auth override first, then global config.
+// Auth attribute "response_header_timeout_seconds": 0/missing inherits global;
+// negative disables; positive uses that many seconds.
+func responseHeaderTimeout(cfg *config.Config, auth *cliproxyauth.Auth) time.Duration {
+	if auth != nil && auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["response_header_timeout_seconds"]); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil {
+				return config.ResolveResponseHeaderTimeout(n)
+			}
+		}
+	}
+	return responseHeaderTimeoutFromConfig(cfg)
+}
+
+func applyResponseHeaderTimeout(transport *http.Transport, headerTimeout time.Duration) {
+	if transport == nil || headerTimeout <= 0 {
+		return
+	}
+	transport.ResponseHeaderTimeout = headerTimeout
+}
+
+// wrapRoundTripperHeaderTimeout applies ResponseHeaderTimeout when the base
+// round tripper is (or wraps) an *http.Transport. Other transports are returned as-is.
+func wrapRoundTripperHeaderTimeout(rt http.RoundTripper, headerTimeout time.Duration) http.RoundTripper {
+	if rt == nil || headerTimeout <= 0 {
+		return rt
+	}
+	if transport, ok := rt.(*http.Transport); ok && transport != nil {
+		cloned := transport.Clone()
+		applyResponseHeaderTimeout(cloned, headerTimeout)
+		return cloned
+	}
+	return rt
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.

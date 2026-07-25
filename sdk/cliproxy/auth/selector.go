@@ -113,6 +113,11 @@ func (e *modelCooldownError) Headers() http.Header {
 }
 
 func authPriority(auth *Auth) int {
+	base := configuredAuthPriority(auth)
+	return base - authDegradationPenalty(auth)
+}
+
+func configuredAuthPriority(auth *Auth) int {
 	if auth == nil || auth.Attributes == nil {
 		return 0
 	}
@@ -125,6 +130,43 @@ func authPriority(auth *Auth) int {
 		return 0
 	}
 	return parsed
+}
+
+// authDegradationPenalty temporarily lowers selection priority when a credential
+// is accumulating recent failures. Soft failures that do not fully cool down
+// the auth still lose scheduling preference until successes recover the window.
+func authDegradationPenalty(auth *Auth) int {
+	if auth == nil {
+		return 0
+	}
+	now := time.Now()
+	// Use the in-memory recent request ring (~last 30 minutes = 3 buckets).
+	var success, failed int64
+	buckets := auth.RecentRequestsSnapshot(now)
+	// Snapshot returns oldest→newest; take the newest 3 buckets (30m).
+	start := 0
+	if len(buckets) > 3 {
+		start = len(buckets) - 3
+	}
+	for _, b := range buckets[start:] {
+		success += b.Success
+		failed += b.Failed
+	}
+	total := success + failed
+	if failed < 2 || total == 0 {
+		return 0
+	}
+	// Require a meaningful failure rate so a single blip does not demote forever.
+	if failed*2 < total { // fail rate < 50%
+		return 0
+	}
+	// Step penalty: 5 per failure after the first, capped so degraded auths
+	// remain reachable when higher-priority peers are exhausted.
+	penalty := int(failed-1) * 5
+	if penalty > 40 {
+		penalty = 40
+	}
+	return penalty
 }
 
 func canonicalModelKey(model string) string {

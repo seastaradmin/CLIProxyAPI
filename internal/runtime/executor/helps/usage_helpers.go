@@ -30,6 +30,9 @@ type UsageReporter struct {
 	authIndex    string
 	authType     string
 	apiKey       string
+	baseURL      string
+	protocol     string
+	supplier     string
 	source       string
 	reasoning    string
 	serviceTier  string
@@ -75,8 +78,33 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	if auth != nil {
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
+		if auth.Attributes != nil {
+			reporter.baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+			reporter.supplier = strings.TrimSpace(auth.Attributes["supplier"])
+			if raw := strings.TrimSpace(auth.Attributes["protocols"]); raw != "" {
+				// Keep raw configured set for display; runtime protocol is refined later if set.
+				reporter.protocol = raw
+			}
+		}
+		if reporter.supplier == "" && auth.Metadata != nil {
+			if s, ok := auth.Metadata["supplier"].(string); ok {
+				reporter.supplier = strings.TrimSpace(s)
+			}
+		}
 	}
 	return reporter
+}
+
+// SetUpstreamProtocol records the actual upstream protocol used for this attempt.
+func (r *UsageReporter) SetUpstreamProtocol(protocol string) {
+	if r == nil {
+		return
+	}
+	protocol = strings.TrimSpace(protocol)
+	if protocol == "" {
+		return
+	}
+	r.protocol = protocol
 }
 
 func ExecutorTypeName(executor any) string {
@@ -269,6 +297,9 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthID:              r.authID,
 		AuthIndex:           r.authIndex,
 		AuthType:            r.authType,
+		BaseURL:             r.baseURL,
+		Protocol:            r.protocol,
+		Supplier:            r.supplier,
 		ReasoningEffort:     r.reasoning,
 		ServiceTier:         r.serviceTier,
 		RequestServiceTier:  r.serviceTier,

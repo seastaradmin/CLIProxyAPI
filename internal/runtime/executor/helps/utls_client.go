@@ -180,6 +180,11 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		standardTransport = ctxRoundTripper
 	}
 
+	headerTimeout := responseHeaderTimeout(cfg, auth)
+	if transport, ok := standardTransport.(*http.Transport); ok && transport != nil {
+		applyResponseHeaderTimeout(transport, headerTimeout)
+		standardTransport = transport
+	}
 	client := &http.Client{
 		Transport: &fallbackRoundTripper{
 			utls:     utlsRT,

@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -212,7 +213,7 @@ func TestRegisterModelsForAuth_OpenAICompatibilityInputModalities(t *testing.T) 
 	}
 }
 
-func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.T) {
+func TestRegisterModelsForAuth_AntigravityUsesAuthoritativeUpstreamModels(t *testing.T) {
 	var sawFetch bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != antigravityModelsPath {
@@ -220,6 +221,13 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer token" {
 			t.Fatalf("Authorization = %q, want bearer token", got)
+		}
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read request body: %v", errRead)
+		}
+		if got := string(body); got != `{"project":"project-1"}` {
+			t.Fatalf("request body = %s, want project payload", got)
 		}
 		sawFetch = true
 		w.Header().Set("Content-Type", "application/json")
@@ -230,11 +238,13 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 						"maxTokens": 1,
 						"maxOutputTokens": 2
 					},
-					"fetched-only-search-model": {
-						"displayName": "Fetched Only Search Model"
+					"gemini-3.6-flash": {
+						"displayName": "Gemini 3.6 Flash",
+						"maxTokens": 1048576,
+						"maxOutputTokens": 65536
 					}
 				},
-				"webSearchModelIds": ["gemini-3.1-flash-lite", "fetched-only-search-model"]
+				"webSearchModelIds": ["gemini-3.6-flash"]
 			}`))
 	}))
 	defer server.Close()
@@ -249,6 +259,7 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 		},
 		Metadata: map[string]any{
 			"access_token": "token",
+			"project_id":   "project-1",
 		},
 	}
 
@@ -272,45 +283,105 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 		}
 	}
 
-	var webSearchModel, agentModel, staticOnlyModel, fetchedOnlyModel *internalregistry.ModelInfo
+	if len(models) != 2 {
+		t.Fatalf("registered models = %d, want exactly upstream model count 2: %#v", len(models), models)
+	}
+
+	var staticModel, fetchedModel, staticOnlyModel *internalregistry.ModelInfo
 	for _, model := range models {
 		if model == nil {
 			continue
 		}
 		switch strings.TrimSpace(model.ID) {
 		case "gemini-3.1-flash-lite":
-			webSearchModel = model
-		case "gemini-3-flash-agent":
-			agentModel = model
+			staticModel = model
+		case "gemini-3.6-flash":
+			fetchedModel = model
 		case "gpt-oss-120b-medium":
 			staticOnlyModel = model
-		case "fetched-only-search-model":
-			fetchedOnlyModel = model
 		}
 	}
-	if webSearchModel == nil {
+	if staticModel == nil {
 		t.Fatal("expected gemini-3.1-flash-lite to be registered")
 	}
-	if !webSearchModel.SupportsWebSearch {
-		t.Fatal("expected gemini-3.1-flash-lite to support web search")
+	if staticModel.SupportsWebSearch {
+		t.Fatal("expected gemini-3.1-flash-lite to be absent from web search model ids")
 	}
 	staticWebSearchModel := staticByID["gemini-3.1-flash-lite"]
 	if staticWebSearchModel == nil {
 		t.Fatal("expected static gemini-3.1-flash-lite definition")
 	}
-	if webSearchModel.ContextLength != staticWebSearchModel.ContextLength || webSearchModel.MaxCompletionTokens != staticWebSearchModel.MaxCompletionTokens {
-		t.Fatalf("static token limits should be preserved, got=%#v static=%#v", webSearchModel, staticWebSearchModel)
+	if staticModel.ContextLength != 1 || staticModel.MaxCompletionTokens != 2 {
+		t.Fatalf("official token limits should win, got=%#v", staticModel)
 	}
-	if agentModel == nil {
-		t.Fatal("expected gemini-3-flash-agent to be registered")
+	if staticModel.Thinking == nil {
+		t.Fatal("expected static thinking metadata to be preserved")
 	}
-	if agentModel.SupportsWebSearch {
-		t.Fatal("gemini-3-flash-agent should not support web search")
+	if fetchedModel == nil {
+		t.Fatal("expected upstream-only gemini-3.6-flash to be registered")
 	}
-	if staticOnlyModel == nil {
-		t.Fatal("expected static-only Antigravity model to remain registered")
+	if !fetchedModel.SupportsWebSearch {
+		t.Fatal("expected gemini-3.6-flash to support web search")
 	}
-	if fetchedOnlyModel != nil {
-		t.Fatalf("fetched-only model should not be registered: %#v", fetchedOnlyModel)
+	if fetchedModel.ContextLength != 1048576 || fetchedModel.MaxCompletionTokens != 65536 {
+		t.Fatalf("upstream-only model token metadata = %#v", fetchedModel)
+	}
+	if staticOnlyModel != nil {
+		t.Fatalf("static-only model should not be registered: %#v", staticOnlyModel)
+	}
+}
+
+func TestRegisterModelsForAuth_OpenAICompatibilityHonorsExcludedModels(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{
+				{
+					Name:    "ciallo",
+					BaseURL: "https://example.com/v1",
+					Models: []config.OpenAICompatibilityModel{
+						{Name: "gpt-5.4", Alias: "gpt-5.4"},
+						{Name: "grok-4.5", Alias: "grok-4.5"},
+						{Name: "deepseek-v4-flash", Alias: "deepseek-v4-flash"},
+					},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-openai-compat-excluded",
+		Provider: "openai-compatible-ciallo",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind":       "api_key",
+			"compat_name":     "ciallo",
+			"provider_key":    "openai-compatible-ciallo",
+			"excluded_models": "gpt-5.4,grok-4.5",
+		},
+	}
+
+	modelRegistry := internalregistry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	models := modelRegistry.GetModelsForClient(auth.ID)
+	seen := map[string]bool{}
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		seen[strings.ToLower(strings.TrimSpace(model.ID))] = true
+	}
+	if seen["gpt-5.4"] {
+		t.Fatal("expected gpt-5.4 to be excluded from openai-compat registration")
+	}
+	if seen["grok-4.5"] {
+		t.Fatal("expected grok-4.5 to be excluded from openai-compat registration")
+	}
+	if !seen["deepseek-v4-flash"] {
+		t.Fatal("expected non-excluded model deepseek-v4-flash to remain registered")
 	}
 }

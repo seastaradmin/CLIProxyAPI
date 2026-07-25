@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
@@ -87,6 +88,11 @@ type Config struct {
 	// TransientErrorCooldownSeconds controls cooldowns for transient upstream errors.
 	// 0 keeps the legacy default cooldown. Negative values disable these cooldowns.
 	TransientErrorCooldownSeconds int `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`
+
+	// ResponseHeaderTimeoutSeconds limits how long to wait for the first upstream response
+	// headers (first-byte / TTFT bound). 0 means default 20s; negative disables the limit.
+	// This does not cap total stream duration after headers arrive.
+	ResponseHeaderTimeoutSeconds int `yaml:"response-header-timeout-seconds" json:"response-header-timeout-seconds"`
 
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
@@ -634,6 +640,14 @@ type OpenAICompatibility struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// Protocols lists upstream native protocols this channel can serve without conversion.
+	// Supported values: chat, responses, messages. Empty defaults to [chat].
+	Protocols []string `yaml:"protocols,omitempty" json:"protocols,omitempty"`
+
+	// ResponseHeaderTimeoutSeconds overrides the global first-byte timeout for this channel.
+	// 0 inherits global; negative disables for this channel.
+	ResponseHeaderTimeoutSeconds int `yaml:"response-header-timeout-seconds,omitempty" json:"response-header-timeout-seconds,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
@@ -643,6 +657,17 @@ type OpenAICompatibilityAPIKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// Models optionally overrides the parent provider model list for this key only.
+	// Empty means inherit the parent OpenAICompatibility.Models.
+	Models []OpenAICompatibilityModel `yaml:"models,omitempty" json:"models,omitempty"`
+
+	// ExcludedModels lists model IDs/patterns excluded for this key only.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// TestModel is the preferred model for management connectivity tests on this key.
+	// UI-only preference; does not affect routing.
+	TestModel string `yaml:"test-model,omitempty" json:"test-model,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
@@ -653,6 +678,11 @@ type OpenAICompatibilityModel struct {
 
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// Fork keeps the original Name routable alongside the Alias. When true and
+	// Alias is set, both names are registered as client-facing model IDs that
+	// map to the same upstream model.
+	Fork bool `yaml:"fork,omitempty" json:"fork,omitempty"`
 
 	// ForceMapping rewrites upstream response model fields back to Alias.
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
@@ -670,6 +700,17 @@ type OpenAICompatibilityModel struct {
 	// Thinking configures the thinking/reasoning capability for this model.
 	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
+
+	// Protocols optionally overrides the parent channel protocols for this model.
+	// Supported values: chat, responses, messages.
+	Protocols []string `yaml:"protocols,omitempty" json:"protocols,omitempty"`
+
+	// ProtocolEndpoints stores the discovered endpoint path suffixes per protocol.
+	// Keys are protocol names (responses, messages), values are path suffixes
+	// relative to base URL (e.g. "/responses" or "/v1/responses").
+	// Populated by protocol-probe-batch auto_apply; executor uses these to avoid
+	// guessing the correct path at runtime.
+	ProtocolEndpoints map[string]string `yaml:"protocol-endpoints,omitempty" json:"protocol-endpoints,omitempty"`
 }
 
 func (m OpenAICompatibilityModel) GetName() string       { return m.Name }
@@ -784,6 +825,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+
+	// Response header timeout is resolved at use time via ResolveResponseHeaderTimeout:
+	// 0 → default 20s, negative → disabled, positive → that many seconds.
+	// No mutation needed here.
 
 	cfg.NormalizePluginsConfig()
 
@@ -1965,4 +2010,28 @@ func removeLegacyAuthBlock(root *yaml.Node) {
 		return
 	}
 	removeMapKey(root, "auth")
+}
+
+// ResolveResponseHeaderTimeout returns the effective first-byte timeout.
+// 0 → 20s default; negative → 0 (disabled); positive → that many seconds.
+func ResolveResponseHeaderTimeout(seconds int) time.Duration {
+	if seconds < 0 {
+		return 0
+	}
+	if seconds == 0 {
+		return 20 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// ResolveFirstChunkTimeout returns the effective bootstrap first-payload timeout.
+// 0 → 30s default; negative → 0 (disabled); positive → that many seconds.
+func ResolveFirstChunkTimeout(seconds int) time.Duration {
+	if seconds < 0 {
+		return 0
+	}
+	if seconds == 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
 }

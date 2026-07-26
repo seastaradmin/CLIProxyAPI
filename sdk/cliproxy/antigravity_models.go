@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -21,34 +20,21 @@ const (
 )
 
 type antigravityFetchAvailableModelsResponse struct {
-	Models            map[string]antigravityAvailableModel `json:"models"`
-	WebSearchModelIDs []string                             `json:"webSearchModelIds"`
-}
-
-type antigravityAvailableModel struct {
-	DisplayName         string `json:"displayName"`
-	MaxTokens           int    `json:"maxTokens"`
-	MaxCompletionTokens int    `json:"maxOutputTokens"`
+	WebSearchModelIDs []string `json:"webSearchModelIds"`
 }
 
 type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 }
 
-type antigravityFetchedModels struct {
-	Models            []*ModelInfo
-	CapabilityHints   antigravityModelCapabilityHints
-	AuthoritativeList bool
-}
-
-func (s *Service) fetchAntigravityModelsForAuth(ctx context.Context, auth *coreauth.Auth) antigravityFetchedModels {
+func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Context, auth *coreauth.Auth) antigravityModelCapabilityHints {
 	if auth == nil || auth.Metadata == nil {
-		return antigravityFetchedModels{}
+		return antigravityModelCapabilityHints{}
 	}
 	accessToken, _ := auth.Metadata["access_token"].(string)
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {
-		return antigravityFetchedModels{}
+		return antigravityModelCapabilityHints{}
 	}
 
 	client := &http.Client{}
@@ -56,9 +42,8 @@ func (s *Service) fetchAntigravityModelsForAuth(ctx context.Context, auth *corea
 		client.Transport = transport
 	}
 
-	payload := antigravityModelsRequestPayload(auth)
 	for _, baseURL := range antigravityModelBaseURLs(auth) {
-		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+antigravityModelsPath, strings.NewReader(string(payload)))
+		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+antigravityModelsPath, strings.NewReader(`{}`))
 		if errReq != nil {
 			continue
 		}
@@ -81,30 +66,12 @@ func (s *Service) fetchAntigravityModelsForAuth(ctx context.Context, auth *corea
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			continue
 		}
-		fetched, ok := parseAntigravityFetchedModels(body)
-		if ok {
-			return fetched
+		hints := parseAntigravityModelCapabilityHints(body)
+		if len(hints.WebSearchModelIDs) > 0 {
+			return hints
 		}
 	}
-	return antigravityFetchedModels{}
-}
-
-func antigravityModelsRequestPayload(auth *coreauth.Auth) []byte {
-	if auth == nil || auth.Metadata == nil {
-		return []byte(`{}`)
-	}
-	projectID, _ := auth.Metadata["project_id"].(string)
-	projectID = strings.TrimSpace(projectID)
-	if projectID == "" {
-		return []byte(`{}`)
-	}
-	payload, errMarshal := json.Marshal(struct {
-		Project string `json:"project"`
-	}{Project: projectID})
-	if errMarshal != nil {
-		return []byte(`{}`)
-	}
-	return payload
+	return antigravityModelCapabilityHints{}
 }
 
 func (s *Service) antigravityModelFetchProxyURL(auth *coreauth.Auth) string {
@@ -146,13 +113,10 @@ func resolveAntigravityModelBaseURL(auth *coreauth.Auth) string {
 	return ""
 }
 
-func parseAntigravityFetchedModels(body []byte) (antigravityFetchedModels, bool) {
+func parseAntigravityModelCapabilityHints(body []byte) antigravityModelCapabilityHints {
 	var parsed antigravityFetchAvailableModelsResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return antigravityFetchedModels{}, false
-	}
-	if parsed.Models == nil {
-		return antigravityFetchedModels{}, false
+		return antigravityModelCapabilityHints{}
 	}
 	webSearchModels := make(map[string]struct{}, len(parsed.WebSearchModelIDs))
 	for _, modelID := range parsed.WebSearchModelIDs {
@@ -161,44 +125,11 @@ func parseAntigravityFetchedModels(body []byte) (antigravityFetchedModels, bool)
 			webSearchModels[modelID] = struct{}{}
 		}
 	}
-
-	modelIDs := make([]string, 0, len(parsed.Models))
-	for modelID := range parsed.Models {
-		modelID = strings.TrimSpace(modelID)
-		if modelID != "" {
-			modelIDs = append(modelIDs, modelID)
-		}
-	}
-	sort.Strings(modelIDs)
-	models := make([]*ModelInfo, 0, len(modelIDs))
-	for _, modelID := range modelIDs {
-		model := parsed.Models[modelID]
-		displayName := strings.TrimSpace(model.DisplayName)
-		if displayName == "" {
-			displayName = modelID
-		}
-		models = append(models, &ModelInfo{
-			ID:                  modelID,
-			Object:              "model",
-			OwnedBy:             "antigravity",
-			Type:                "antigravity",
-			DisplayName:         displayName,
-			Name:                modelID,
-			Description:         displayName,
-			ContextLength:       model.MaxTokens,
-			MaxCompletionTokens: model.MaxCompletionTokens,
-		})
-	}
-
-	return antigravityFetchedModels{
-		Models:            models,
-		CapabilityHints:   antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels},
-		AuthoritativeList: true,
-	}, true
+	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels}
 }
 
 func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
-	if len(models) == 0 {
+	if len(models) == 0 || len(hints.WebSearchModelIDs) == 0 {
 		return models
 	}
 
@@ -207,60 +138,9 @@ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigra
 			continue
 		}
 		modelID := normalizeAntigravityFetchedModelID(model.ID)
-		_, model.SupportsWebSearch = hints.WebSearchModelIDs[modelID]
-	}
-	return models
-}
-
-// mergeAntigravityFetchedModels preserves static metadata for models that the
-// upstream account currently exposes. The upstream response remains authoritative
-// for membership and current display/token metadata.
-func mergeAntigravityFetchedModels(staticModels, fetchedModels []*ModelInfo) []*ModelInfo {
-	staticByID := make(map[string]*ModelInfo, len(staticModels))
-	for _, model := range staticModels {
-		if model == nil {
-			continue
+		if _, ok := hints.WebSearchModelIDs[modelID]; ok {
+			model.SupportsWebSearch = true
 		}
-		if modelID := normalizeAntigravityFetchedModelID(model.ID); modelID != "" {
-			staticByID[modelID] = model
-		}
-	}
-
-	models := make([]*ModelInfo, 0, len(fetchedModels))
-	for _, fetched := range fetchedModels {
-		if fetched == nil {
-			continue
-		}
-		modelID := normalizeAntigravityFetchedModelID(fetched.ID)
-		if modelID == "" {
-			continue
-		}
-		static := staticByID[modelID]
-		if static == nil {
-			model := *fetched
-			models = append(models, &model)
-			continue
-		}
-
-		model := *static
-		model.ID = fetched.ID
-		model.Object = fetched.Object
-		model.OwnedBy = fetched.OwnedBy
-		model.Type = fetched.Type
-		model.Name = fetched.Name
-		if fetched.DisplayName != "" {
-			model.DisplayName = fetched.DisplayName
-		}
-		if fetched.Description != "" {
-			model.Description = fetched.Description
-		}
-		if fetched.ContextLength > 0 {
-			model.ContextLength = fetched.ContextLength
-		}
-		if fetched.MaxCompletionTokens > 0 {
-			model.MaxCompletionTokens = fetched.MaxCompletionTokens
-		}
-		models = append(models, &model)
 	}
 	return models
 }

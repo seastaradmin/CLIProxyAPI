@@ -11,8 +11,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -256,6 +258,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
+			h.maybeMarkStreamInterruptionRetryable(errMsg)
 			h.WriteErrorResponse(c, errMsg)
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
@@ -266,6 +269,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case chunk, ok := <-dataChan:
 			if !ok {
 				if errMsg, okPendingErr := pendingClaudeStreamError(errChan); okPendingErr {
+					h.maybeMarkStreamInterruptionRetryable(errMsg)
 					h.WriteErrorResponse(c, errMsg)
 					if errMsg != nil {
 						cliCancel(errMsg.Error)
@@ -326,6 +330,7 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			if errMsg == nil {
 				return
 			}
+			h.maybeMarkStreamInterruptionRetryable(errMsg)
 			status := http.StatusInternalServerError
 			if errMsg.StatusCode > 0 {
 				status = errMsg.StatusCode
@@ -333,9 +338,38 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 			c.Status(status)
 
 			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			log.Infof("claude handler: writing terminal stream error event: status=%d body=%s", status, errorBytes)
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 		},
 	})
+}
+
+// maybeMarkStreamInterruptionRetryable maps transport-level stream interruptions
+// (context canceled, unexpected EOF, network errors) to 529 overloaded_error so
+// Claude Code's SDK retries the request instead of failing the turn. Genuine
+// upstream status errors (auth, rate limits, invalid requests) are left intact.
+func (h *ClaudeCodeAPIHandler) maybeMarkStreamInterruptionRetryable(msg *interfaces.ErrorMessage) {
+	if msg == nil || msg.Error == nil {
+		return
+	}
+	if isRetryableStreamInterruption(msg.Error) {
+		msg.StatusCode = 529
+	}
+}
+
+func isRetryableStreamInterruption(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
 }
 
 type claudeErrorDetail struct {
@@ -412,8 +446,11 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 	if json.Valid([]byte(message)) {
 		if err := json.Unmarshal([]byte(message), &payload); err == nil {
 			if e, ok := payload["error"].(map[string]any); ok {
-				if t, ok := e["type"].(string); ok && strings.TrimSpace(t) != "" {
-					errType = strings.TrimSpace(t)
+				if t, ok := e["type"].(string); ok {
+					t = strings.TrimSpace(t)
+					if !isNilErrorType(t) {
+						errType = t
+					}
 				}
 				if m, ok := e["message"].(string); ok && strings.TrimSpace(m) != "" {
 					message = strings.TrimSpace(m)
@@ -421,8 +458,11 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 					message = strings.TrimSpace(c)
 				}
 			} else {
-				if t, ok := payload["type"].(string); ok && strings.TrimSpace(t) != "" && strings.TrimSpace(t) != "error" {
-					errType = strings.TrimSpace(t)
+				if t, ok := payload["type"].(string); ok {
+					t = strings.TrimSpace(t)
+					if t != "" && t != "error" && !isNilErrorType(t) {
+						errType = t
+					}
 				}
 				if m, ok := payload["message"].(string); ok && strings.TrimSpace(m) != "" {
 					message = strings.TrimSpace(m)
@@ -432,6 +472,17 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 	}
 
 	return errType, message
+}
+
+// isNilErrorType reports whether an upstream-provided error type is a
+// placeholder (e.g. Go's "<nil>" stringification) rather than a real error
+// classification, in which case the status-derived type should be kept.
+func isNilErrorType(t string) bool {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "", "<nil>", "nil", "null", "none", "unknown":
+		return true
+	}
+	return false
 }
 
 func claudeErrorTypeFromStatus(status int) string {

@@ -272,6 +272,25 @@ func NormalizeExcludedModels(models []string) []string {
 	return out
 }
 
+// NormalizeOAuthDisabledChannels lowercases and trims provider keys for the oauth-disabled-channels map.
+func NormalizeOAuthDisabledChannels(entries map[string]bool) map[string]bool {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(entries))
+	for provider, disabled := range entries {
+		key := strings.ToLower(strings.TrimSpace(provider))
+		if key == "" {
+			continue
+		}
+		out[key] = disabled
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // NormalizeOAuthExcludedModels cleans provider -> excluded models mappings by normalizing provider keys
 // and applying model exclusion normalization to each entry.
 func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]string {

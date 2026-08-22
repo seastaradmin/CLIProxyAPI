@@ -166,8 +166,10 @@ type RecentRequestBucket struct {
 
 // QuotaState contains limiter tracking data for a credential.
 type QuotaState struct {
-	// Exceeded indicates the credential recently hit a quota error.
+	// Exceeded indicates the credential recently hit a quota or rate-limit error.
 	Exceeded bool `json:"exceeded"`
+	// Kind distinguishes exhausted quota from temporary rate limiting.
+	Kind string `json:"kind,omitempty"`
 	// Reason provides an optional provider specific human readable description.
 	Reason string `json:"reason,omitempty"`
 	// NextRecoverAt is when the credential may become available again.

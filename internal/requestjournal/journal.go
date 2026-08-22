@@ -15,6 +15,7 @@ import (
 	"time"
 
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
@@ -46,6 +47,7 @@ type Record struct {
 	TTFTMs       int64          `json:"ttft_ms"`
 	Failed       bool           `json:"failed"`
 	StatusCode   int            `json:"status_code"`
+	FailureKind  string         `json:"failure_kind,omitempty"`
 	ErrorBody    string         `json:"error_body,omitempty"`
 	Source       string         `json:"source,omitempty"`
 	Tokens       map[string]any `json:"tokens,omitempty"`
@@ -124,6 +126,16 @@ func fromUsage(ctx context.Context, record coreusage.Record) Record {
 		}
 		errBody = truncateJournalBody(strings.TrimSpace(record.Fail.Body))
 	}
+	failureKind := ""
+	if record.Failed {
+		if record.Fail.NetworkError {
+			// Transport-level failure (DNS/dial/TLS/timeout): attribute it to
+			// the network environment, not the credential.
+			failureKind = "network"
+		} else {
+			failureKind = classifyFailure(status, errBody)
+		}
+	}
 
 	tokens := map[string]any{}
 	if record.Detail.InputTokens != 0 {
@@ -145,11 +157,7 @@ func fromUsage(ctx context.Context, record coreusage.Record) Record {
 		tokens = nil
 	}
 
-	// Mask api key like UI previews.
-	apiKey := strings.TrimSpace(record.APIKey)
-	if len(apiKey) > 10 {
-		apiKey = apiKey[:4] + "****" + apiKey[len(apiKey)-4:]
-	}
+	apiKey := maskSecret(record.APIKey)
 
 	return Record{
 		ID:           id,
@@ -169,8 +177,9 @@ func fromUsage(ctx context.Context, record coreusage.Record) Record {
 		TTFTMs:       record.TTFT.Milliseconds(),
 		Failed:       record.Failed,
 		StatusCode:   status,
+		FailureKind:  failureKind,
 		ErrorBody:    errBody,
-		Source:       strings.TrimSpace(record.Source),
+		Source:       sanitizeSource(record.Source, record.AuthType),
 		Tokens:       tokens,
 		ExecutorType: strings.TrimSpace(record.ExecutorType),
 	}
@@ -310,9 +319,69 @@ func readFile(path string) ([]Record, error) {
 		if strings.TrimSpace(rec.ID) == "" {
 			continue
 		}
+		sanitizeRecord(&rec)
 		out = append(out, rec)
 	}
 	return out, sc.Err()
+}
+
+func sanitizeRecord(rec *Record) {
+	if rec == nil {
+		return
+	}
+	rec.APIKey = maskSecret(rec.APIKey)
+	rec.Source = sanitizeSource(rec.Source, rec.AuthType)
+	if rec.Failed {
+		if rec.StatusCode <= 0 {
+			rec.StatusCode = 500
+		}
+		if strings.TrimSpace(rec.FailureKind) == "" {
+			rec.FailureKind = classifyFailure(rec.StatusCode, rec.ErrorBody)
+		}
+	}
+}
+
+func classifyFailure(statusCode int, body string) string {
+	if kind := coreauth.ClassifyUsageError(statusCode, "", body); kind != "" {
+		return string(kind)
+	}
+	switch statusCode {
+	case 499:
+		return "client_cancelled"
+	case 401, 403:
+		return "authentication"
+	case 400, 422:
+		return "invalid_request"
+	case 404:
+		return "model_unavailable"
+	case 408, 500, 502, 503, 504:
+		return "upstream_error"
+	case 0:
+		return "unknown"
+	default:
+		return "request_error"
+	}
+}
+
+func maskSecret(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 10 || strings.Contains(value, "****") {
+		return value
+	}
+	return value[:4] + "****" + value[len(value)-4:]
+}
+
+func sanitizeSource(source, authType string) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return source
+	}
+	lowerType := strings.ToLower(strings.TrimSpace(authType))
+	if strings.Contains(lowerType, "api") || strings.HasPrefix(source, "sk-") || strings.HasPrefix(source, "sk_") || strings.HasPrefix(source, "gsk_") || strings.HasPrefix(source, "xai-") || strings.HasPrefix(source, "AIza") {
+		return maskSecret(source)
+	}
+	// Emails and other non-key identifiers pass through unmasked.
+	return source
 }
 
 // DeleteID hard-deletes one record by id across journal files.

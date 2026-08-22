@@ -32,6 +32,13 @@ const ServiceTierMetadataKey = "service_tier"
 const GenerateMetadataKey = "generate"
 
 const (
+	// ImageFingerprintsMetadataKey stores image content fingerprints detected in the request.
+	ImageFingerprintsMetadataKey = "image_fingerprints"
+	// ImageFingerprintCacheHitsMetadataKey stores the number of previously seen images.
+	ImageFingerprintCacheHitsMetadataKey = "image_fingerprint_cache_hits"
+	// ImageFingerprintCacheMissesMetadataKey stores the number of newly seen images.
+	ImageFingerprintCacheMissesMetadataKey = "image_fingerprint_cache_misses"
+
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.

@@ -62,6 +62,17 @@ type Config struct {
 	// Default: 60. Max: 3600.
 	RedisUsageQueueRetentionSeconds int `yaml:"redis-usage-queue-retention-seconds" json:"redis-usage-queue-retention-seconds"`
 
+	// AvailabilityRetentionHours controls how long availability metrics (success
+	// rate, latency, token totals) are kept for the management monitoring UI.
+	// The selectable monitoring window is capped at this value, so values above
+	// 24 enable long-range windows such as 7d/30d. Default: 24. Max: 720.
+	AvailabilityRetentionHours int `yaml:"availability-retention-hours" json:"availability-retention-hours"`
+
+	// RequestJournalKeepDays controls how many days of durable request journal
+	// (JSONL under logs/request-journal, includes per-request token detail)
+	// are retained. Default: 30. Set to 0 to keep the default.
+	RequestJournalKeepDays int `yaml:"request-journal-keep-days" json:"request-journal-keep-days"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -151,6 +162,14 @@ type Config struct {
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, claude-api-key, openai-compatibility, and vertex-api-key.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
+
+	// OAuthDisabledChannels disables entire OAuth/file-backed channels by provider key.
+	// When a channel key is set to true (e.g. "codex: true"), all auth records whose
+	// Provider matches that key are excluded from routing and availability checks,
+	// effectively taking the entire channel offline. Affected channels: vertex,
+	// aistudio, antigravity, claude, codex, kimi, xai. Existing per-credential disabled
+	// flags and API-key provider disabled fields take precedence and remain independent.
+	OAuthDisabledChannels map[string]bool `yaml:"oauth-disabled-channels,omitempty" json:"oauth-disabled-channels,omitempty"`
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`

@@ -88,8 +88,15 @@ func RegisteredProviders() []Provider {
 	}
 	if exclusiveProvider != "" {
 		if provider, exists := registry[exclusiveProvider]; exists && provider != nil {
+			// Always include config API key provider as fallback even in exclusive mode.
+			result := []Provider{provider}
+			if exclusiveProvider != AccessProviderTypeConfigAPIKey {
+				if cfgProvider, cfgExists := registry[AccessProviderTypeConfigAPIKey]; cfgExists && cfgProvider != nil {
+					result = append(result, cfgProvider)
+				}
+			}
 			registryMu.RUnlock()
-			return []Provider{provider}
+			return result
 		}
 	}
 	providers := make([]Provider, 0, len(order))

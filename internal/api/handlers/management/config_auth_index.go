@@ -3,9 +3,12 @@ package management
 import (
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type geminiKeyWithAuthIndex struct {
@@ -50,6 +53,11 @@ type openAICompatibilityWithAuthIndex struct {
 	DisableCooling bool                                     `json:"disable-cooling,omitempty"`
 	Protocols      []string                                 `json:"protocols,omitempty"`
 	AuthIndex      string                                   `json:"auth-index,omitempty"`
+	InCooldown     bool                                     `json:"in_cooldown,omitempty"`
+	CooldownKind   string                                   `json:"cooldown_kind,omitempty"`
+	CooldownReason string                                   `json:"cooldown_reason,omitempty"`
+	CooldownUntil  *time.Time                               `json:"cooldown_until,omitempty"`
+	CooldownModels []gin.H                                  `json:"cooldown_models,omitempty"`
 }
 
 func (h *Handler) liveAuthIndexByID() map[string]string {
@@ -80,6 +88,32 @@ func (h *Handler) liveAuthIndexByID() map[string]string {
 			continue
 		}
 		out[id] = idx
+	}
+	return out
+}
+
+// liveAuthByID returns a map of auth ID to the full auth snapshot.
+func (h *Handler) liveAuthByID() map[string]*coreauth.Auth {
+	out := map[string]*coreauth.Auth{}
+	if h == nil {
+		return out
+	}
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	if manager == nil {
+		return out
+	}
+	for _, auth := range manager.List() {
+		if auth == nil {
+			continue
+		}
+		id := strings.TrimSpace(auth.ID)
+		if id == "" {
+			continue
+		}
+		auth.EnsureIndex()
+		out[id] = auth
 	}
 	return out
 }
@@ -259,7 +293,7 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 	if h == nil {
 		return nil
 	}
-	liveIndexByID := h.liveAuthIndexByID()
+	liveAuths := h.liveAuthByID()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -270,6 +304,7 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 	normalized := normalizedOpenAICompatibilityEntries(h.cfg.OpenAICompatibility)
 	out := make([]openAICompatibilityWithAuthIndex, len(normalized))
 	idGen := synthesizer.NewStableIDGenerator()
+	now := time.Now()
 	for i := range normalized {
 		entry := normalized[i]
 		providerName := strings.ToLower(strings.TrimSpace(entry.Name))
@@ -292,19 +327,83 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 		}
 		if len(entry.APIKeyEntries) == 0 {
 			id, _ := idGen.Next(idKind, entry.BaseURL)
-			response.AuthIndex = liveIndexByID[id]
+			auth := liveAuths[id]
+			if auth != nil {
+				response.AuthIndex = auth.Index
+				fillCooldownFromAuth(&response, auth, now)
+			} else {
+				response.AuthIndex = id
+			}
 		} else {
 			response.APIKeyEntries = make([]openAICompatibilityAPIKeyWithAuthIndex, len(entry.APIKeyEntries))
+			var combinedCooldown authCooldownSummary
 			for j := range entry.APIKeyEntries {
 				apiKeyEntry := entry.APIKeyEntries[j]
 				id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL)
+				auth := liveAuths[id]
+				authIdx := ""
+				if auth != nil {
+					authIdx = auth.Index
+				}
+				if authIdx == "" {
+					authIdx = id
+				}
 				response.APIKeyEntries[j] = openAICompatibilityAPIKeyWithAuthIndex{
 					OpenAICompatibilityAPIKey: apiKeyEntry,
-					AuthIndex:                 liveIndexByID[id],
+					AuthIndex:                 authIdx,
 				}
+				if auth != nil {
+					summary := authCooldownSummaryFor(auth, now)
+					if summary.inCooldown {
+						mergeCooldownSummary(&combinedCooldown, summary)
+					}
+				}
+			}
+			if combinedCooldown.inCooldown {
+				fillCooldownFromSummary(&response, &combinedCooldown)
 			}
 		}
 		out[i] = response
 	}
 	return out
+}
+
+// fillCooldownFromAuth populates cooldown fields on the response from a single auth.
+func fillCooldownFromAuth(resp *openAICompatibilityWithAuthIndex, auth *coreauth.Auth, now time.Time) {
+	summary := authCooldownSummaryFor(auth, now)
+	if !summary.inCooldown {
+		return
+	}
+	fillCooldownFromSummary(resp, &summary)
+}
+
+// fillCooldownFromSummary populates cooldown fields on the response from a pre-computed summary.
+func fillCooldownFromSummary(resp *openAICompatibilityWithAuthIndex, summary *authCooldownSummary) {
+	if summary == nil || !summary.inCooldown {
+		return
+	}
+	resp.InCooldown = true
+	resp.CooldownKind = summary.kind
+	resp.CooldownReason = summary.reason
+	if !summary.until.IsZero() {
+		t := summary.until
+		resp.CooldownUntil = &t
+	}
+	if len(summary.models) > 0 {
+		resp.CooldownModels = summary.models
+	}
+}
+
+// mergeCooldownSummary merges src into dst, keeping the earliest recovery deadline.
+func mergeCooldownSummary(dst *authCooldownSummary, src authCooldownSummary) {
+	if !src.inCooldown {
+		return
+	}
+	dst.inCooldown = true
+	if dst.until.IsZero() || src.until.Before(dst.until) {
+		dst.until = src.until
+		dst.kind = src.kind
+		dst.reason = src.reason
+	}
+	dst.models = append(dst.models, src.models...)
 }

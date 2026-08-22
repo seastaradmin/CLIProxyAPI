@@ -22,6 +22,12 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Auth material defaults under `auths/`
 - Storage backends: file-based default; optional Postgres/git/object store (`PGSTORE_*`, `GITSTORE_*`, `OBJECTSTORE_*`)
 
+## Documentation
+
+- **Product docs (behavior & maintenance reference)**: `docs/retry-and-auth-switching_CN.md` — retry windows, credential rotation, cooldown/backoff, session affinity, and error mapping. **Read this before changing anything in `sdk/cliproxy/auth/` or the retry/error paths in `sdk/api/handlers/`.**
+- **Backend/architecture docs**: this file (see `Architecture` and `Code Conventions` below; `CLAUDE.md` is an alias for it) is the authoritative reference for backend structure and coding rules.
+- **SDK integration docs**: `docs/sdk-usage*.md`, `docs/sdk-advanced*.md`, `docs/sdk-access*.md`, `docs/sdk-watcher*.md` (English + `_CN` variants).
+
 ## Architecture
 - `cmd/server/` — Server entrypoint
 - `internal/api/` — Gin HTTP API (routes, middleware, modules)

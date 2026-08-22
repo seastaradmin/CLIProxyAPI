@@ -18,6 +18,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 )
@@ -61,6 +62,9 @@ type Service struct {
 
 	// server is the HTTP API server instance.
 	server *api.Server
+
+	// supabaseUsageSync asynchronously persists bounded daily usage deltas.
+	supabaseUsageSync *coreusage.SupabaseUsageSync
 
 	// pprofServer manages the optional pprof HTTP debug server.
 	pprofServer *pprofServer

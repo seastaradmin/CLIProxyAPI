@@ -3,18 +3,20 @@
 package watcher
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/probe"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
-	"gopkg.in/yaml.v3"
-
 	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
 )
 
 func (w *Watcher) stopConfigReloadTimer() {
@@ -140,5 +142,162 @@ func (w *Watcher) reloadConfig() bool {
 
 	log.Infof("config successfully reloaded, triggering client reload")
 	w.reloadClients(authDirChanged, affectedOAuthProviders, forceAuthRefresh)
+
+	// Auto-probe openai-compat providers that lack protocol-endpoints.
+	w.triggerAutoProbe(oldConfig, newConfig)
+
 	return true
+}
+
+// triggerAutoProbe launches background protocol probing for openai-compat providers
+// that are new or missing protocol-endpoints configuration.
+func (w *Watcher) triggerAutoProbe(oldCfg, newCfg *config.Config) {
+	if newCfg == nil || len(newCfg.OpenAICompatibility) == 0 {
+		return
+	}
+	// Collect providers needing probe.
+	var targets []probe.ProviderTarget
+	for i := range newCfg.OpenAICompatibility {
+		compat := &newCfg.OpenAICompatibility[i]
+		if compat.Disabled || strings.TrimSpace(compat.BaseURL) == "" {
+			continue
+		}
+		// Skip if all models already have protocol-endpoints.
+		if compatHasEndpoints(compat) {
+			continue
+		}
+		// Determine test model.
+		model := resolveProbeModel(compat)
+		if model == "" {
+			continue
+		}
+		apiKey := ""
+		if len(compat.APIKeyEntries) > 0 {
+			apiKey = strings.TrimSpace(compat.APIKeyEntries[0].APIKey)
+		}
+		targets = append(targets, probe.ProviderTarget{
+			Name:    compat.Name,
+			BaseURL: compat.BaseURL,
+			APIKey:  apiKey,
+			Model:   model,
+		})
+	}
+	if len(targets) == 0 {
+		return
+	}
+	configPath := w.configPath
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		for _, target := range targets {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Infof("auto-probe: probing provider %q (model=%s)", target.Name, target.Model)
+			results := probe.ProbeProvider(ctx, target)
+			if len(results) == 0 {
+				log.Warnf("auto-probe: provider %q - no protocols succeeded", target.Name)
+				continue
+			}
+			protocols := probe.SupportedProtocols(results)
+			endpoints := probe.ProtocolEndpoints(target.BaseURL, results)
+			log.Infof("auto-probe: provider %q - protocols=%v endpoints=%v", target.Name, protocols, endpoints)
+			// Persist results to config file.
+			if errApply := applyProbeResultsToConfig(configPath, target.Name, protocols, endpoints); errApply != nil {
+				log.Warnf("auto-probe: failed to persist results for %q: %v", target.Name, errApply)
+			}
+		}
+	}()
+}
+
+// compatHasEndpoints returns true if all models in the provider have protocol-endpoints.
+func compatHasEndpoints(compat *config.OpenAICompatibility) bool {
+	models := compat.Models
+	for k := range compat.APIKeyEntries {
+		if len(compat.APIKeyEntries[k].Models) > 0 {
+			models = compat.APIKeyEntries[k].Models
+			break
+		}
+	}
+	if len(models) == 0 {
+		return false
+	}
+	for i := range models {
+		if len(models[i].ProtocolEndpoints) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveProbeModel picks the best model to use for probing.
+func resolveProbeModel(compat *config.OpenAICompatibility) string {
+	// Prefer per-key test-model.
+	for k := range compat.APIKeyEntries {
+		entry := &compat.APIKeyEntries[k]
+		if tm := strings.TrimSpace(entry.TestModel); tm != "" {
+			return tm
+		}
+		if len(entry.Models) > 0 {
+			if name := strings.TrimSpace(entry.Models[0].Name); name != "" {
+				return name
+			}
+		}
+	}
+	// Fall back to provider-level models.
+	if len(compat.Models) > 0 {
+		if name := strings.TrimSpace(compat.Models[0].Name); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// applyProbeResultsToConfig writes probe results back to the config file.
+func applyProbeResultsToConfig(configPath, providerName string, protocols []string, endpoints map[string]string) error {
+	cfg, errLoad := config.LoadConfig(configPath)
+	if errLoad != nil {
+		return errLoad
+	}
+	modified := false
+	for i := range cfg.OpenAICompatibility {
+		compat := &cfg.OpenAICompatibility[i]
+		if !strings.EqualFold(strings.TrimSpace(compat.Name), providerName) {
+			continue
+		}
+		// Update per-key models first, then provider-level.
+		updateModels := func(models []config.OpenAICompatibilityModel) {
+			for j := range models {
+				m := &models[j]
+				if len(m.ProtocolEndpoints) > 0 {
+					continue // already has endpoints
+				}
+				if len(protocols) > 0 {
+					m.Protocols = protocols
+				}
+				if len(endpoints) > 0 {
+					m.ProtocolEndpoints = endpoints
+				}
+				modified = true
+			}
+		}
+		for k := range compat.APIKeyEntries {
+			if len(compat.APIKeyEntries[k].Models) > 0 {
+				updateModels(compat.APIKeyEntries[k].Models)
+			}
+		}
+		if len(compat.Models) > 0 {
+			updateModels(compat.Models)
+		}
+		// Set provider-level protocols if discovered.
+		if len(protocols) > 0 && len(compat.Protocols) == 0 {
+			compat.Protocols = protocols
+			modified = true
+		}
+		break
+	}
+	if !modified {
+		return nil
+	}
+	return config.SaveConfigPreserveComments(configPath, cfg)
 }

@@ -26,8 +26,10 @@ type AvailabilitySample struct {
 	Failed       bool
 	ClientFault  bool // excluded from availability denominator (cancel / bad request)
 	RateLimited  bool
+	NetworkError bool // transport-level failure (DNS/dial/TLS/timeout), not credential-specific
 	Latency      time.Duration
 	TTFT         time.Duration
+	TotalTokens  int64
 	OutputTokens int64
 	CachedTokens int64
 	InputTokens  int64
@@ -88,37 +90,44 @@ type AvailabilityBucket struct {
 
 // AvailabilitySnapshot is aggregated metrics for one key over a window.
 type AvailabilitySnapshot struct {
-	Key          AvailabilityKey      `json:"key"`
-	Window       string               `json:"window"`
-	From         time.Time            `json:"from"`
-	To           time.Time            `json:"to"`
-	Total        int64                `json:"total"`
-	Success      int64                `json:"success"`
-	Failed       int64                `json:"failed"`
-	RateLimited  int64                `json:"rate_limited"`
-	Excluded     int64                `json:"excluded_client_faults"`
-	SuccessRate  float64              `json:"success_rate"`
-	Availability float64              `json:"availability"` // success / (success+failed excluding client faults & optional rate limits as soft)
-	LatencyP50MS float64              `json:"latency_p50_ms"`
-	LatencyP95MS float64              `json:"latency_p95_ms"`
-	TTFTP50MS    float64              `json:"ttft_p50_ms"`
-	TTFTP95MS    float64              `json:"ttft_p95_ms"`
-	TPS          float64              `json:"tps"`
-	CacheHitRate float64              `json:"cache_hit_rate"`
-	HasTraffic   bool                 `json:"has_traffic"`
-	Buckets      []AvailabilityBucket `json:"buckets,omitempty"`
-	LastSampleAt time.Time            `json:"last_sample_at,omitempty"`
-	LastErrorAt  time.Time            `json:"last_error_at,omitempty"`
-	Status       string               `json:"status"` // running | degraded | no_data
+	Key           AvailabilityKey      `json:"key"`
+	Window        string               `json:"window"`
+	From          time.Time            `json:"from"`
+	To            time.Time            `json:"to"`
+	Total         int64                `json:"total"`
+	Success       int64                `json:"success"`
+	Failed        int64                `json:"failed"`
+	RateLimited   int64                `json:"rate_limited"`
+	NetworkErrors int64                `json:"network_errors"`
+	Excluded      int64                `json:"excluded_client_faults"`
+	SuccessRate   float64              `json:"success_rate"`
+	Availability  float64              `json:"availability"` // success / (success+failed excluding client faults & optional rate limits as soft)
+	LatencyP50MS  float64              `json:"latency_p50_ms"`
+	LatencyP95MS  float64              `json:"latency_p95_ms"`
+	TTFTP50MS     float64              `json:"ttft_p50_ms"`
+	TTFTP95MS     float64              `json:"ttft_p95_ms"`
+	TPS           float64              `json:"tps"`
+	InputTokens   int64                `json:"input_tokens"`
+	TotalTokens   int64                `json:"total_tokens"`
+	CachedTokens  int64                `json:"cached_tokens"`
+	CacheHitRate  float64              `json:"cache_hit_rate"`
+	HasTraffic    bool                 `json:"has_traffic"`
+	Buckets       []AvailabilityBucket `json:"buckets,omitempty"`
+	LastSampleAt  time.Time            `json:"last_sample_at,omitempty"`
+	LastErrorAt   time.Time            `json:"last_error_at,omitempty"`
+	Status        string               `json:"status"` // running | degraded | no_data
 }
 
 // AvailabilityAggregator accumulates usage samples in memory for management views.
 type AvailabilityAggregator struct {
-	mu        sync.RWMutex
-	samples   map[string][]AvailabilitySample
-	keys      map[string]AvailabilityKey
-	retention time.Duration
-	bucket    time.Duration
+	mu         sync.RWMutex
+	samples    map[string][]AvailabilitySample
+	keys       map[string]AvailabilityKey
+	retention  time.Duration
+	bucket     time.Duration
+	maxSamples int
+	// dirty marks that new samples arrived since the last persistence flush.
+	dirty bool
 }
 
 // NewAvailabilityAggregator creates an in-memory aggregator.
@@ -130,11 +139,43 @@ func NewAvailabilityAggregator(retention, bucket time.Duration) *AvailabilityAgg
 		bucket = DefaultAvailabilityBucket
 	}
 	return &AvailabilityAggregator{
-		samples:   make(map[string][]AvailabilitySample),
-		keys:      make(map[string]AvailabilityKey),
-		retention: retention,
-		bucket:    bucket,
+		samples:    make(map[string][]AvailabilitySample),
+		keys:       make(map[string]AvailabilityKey),
+		retention:  retention,
+		bucket:     bucket,
+		maxSamples: maxSamplesPerKey,
 	}
+}
+
+// SetRetention updates the sample retention window. Samples older than the new
+// window are dropped by the next Observe/load pass.
+func (a *AvailabilityAggregator) SetRetention(retention time.Duration) {
+	if a == nil || retention <= 0 {
+		return
+	}
+	a.mu.Lock()
+	a.retention = retention
+	a.mu.Unlock()
+}
+
+// SetMaxSamples updates the per-key sample cap. Values <= 0 keep the current cap.
+func (a *AvailabilityAggregator) SetMaxSamples(maxSamples int) {
+	if a == nil || maxSamples <= 0 {
+		return
+	}
+	a.mu.Lock()
+	a.maxSamples = maxSamples
+	a.mu.Unlock()
+}
+
+// Retention returns the configured sample retention window.
+func (a *AvailabilityAggregator) Retention() time.Duration {
+	if a == nil {
+		return DefaultAvailabilityRetention
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.retention
 }
 
 // HandleUsage implements Plugin so the aggregator can register on the usage manager.
@@ -149,13 +190,17 @@ func (a *AvailabilityAggregator) HandleUsage(_ context.Context, record Record) {
 	status := record.Fail.StatusCode
 	clientFault := !record.Failed && false
 	if record.Failed {
-		// Client cancels / bad requests should not drag availability.
-		if status == 400 || status == 404 || status == 413 || status == 422 {
+		// Client cancels / bad requests should not drag availability. Provider
+		// capability/compatibility failures (model unavailable, protocol format
+		// rejection, unsupported features) are NOT client faults: they reflect
+		// the provider and must count against its availability.
+		if availabilityClientFaultStatus(status) && !isProviderCompatibilityFailure(record.Fail.Body) {
 			clientFault = true
 		}
 		// Treat empty body client aborts similarly when status is 0 and latency is tiny? keep simple.
 	}
 	rateLimited := record.Failed && (status == 429 || status == 402)
+	detail, inputTokens, cachedTokens := canonicalTokenMetrics(record)
 	a.Observe(AvailabilityKey{
 		Provider:  record.Provider,
 		AuthID:    record.AuthID,
@@ -169,11 +214,13 @@ func (a *AvailabilityAggregator) HandleUsage(_ context.Context, record Record) {
 		Failed:       record.Failed,
 		ClientFault:  clientFault,
 		RateLimited:  rateLimited,
+		NetworkError: record.Failed && record.Fail.NetworkError,
 		Latency:      record.Latency,
 		TTFT:         record.TTFT,
-		OutputTokens: record.Detail.OutputTokens,
-		CachedTokens: record.Detail.CachedTokens + record.Detail.CacheReadTokens,
-		InputTokens:  record.Detail.InputTokens,
+		TotalTokens:  detail.TotalTokens,
+		OutputTokens: detail.OutputTokens,
+		CachedTokens: cachedTokens,
+		InputTokens:  inputTokens,
 	})
 }
 
@@ -201,11 +248,12 @@ func (a *AvailabilityAggregator) Observe(key AvailabilityKey, sample Availabilit
 		if start > 0 {
 			list = append([]AvailabilitySample(nil), list[start:]...)
 		}
-		if len(list) > maxSamplesPerKey {
-			list = append([]AvailabilitySample(nil), list[len(list)-maxSamplesPerKey:]...)
+		if len(list) > a.maxSamples {
+			list = append([]AvailabilitySample(nil), list[len(list)-a.maxSamples:]...)
 		}
 	}
 	a.samples[id] = list
+	a.dirty = true
 }
 
 // Snapshot returns aggregated metrics for all keys in the window ending at now.
@@ -323,14 +371,14 @@ func buildSnapshot(key AvailabilityKey, samples []AvailabilitySample, from, to t
 	}
 
 	var (
-		total, success, failed, rateLimited, excluded int64
-		latencies, ttfts                              []float64
-		outTokens                                     float64
-		genSeconds                                    float64
-		cached, inputs                                int64
-		lastSample, lastError                         time.Time
-		bucketLatencySum                              = make([]float64, bucketCount)
-		bucketLatencyN                                = make([]int64, bucketCount)
+		total, success, failed, rateLimited, networkErrors, excluded int64
+		latencies, ttfts                                             []float64
+		outTokens                                                    float64
+		genSeconds                                                   float64
+		totalTokens, cached, inputs                                  int64
+		lastSample, lastError                                        time.Time
+		bucketLatencySum                                             = make([]float64, bucketCount)
+		bucketLatencyN                                               = make([]int64, bucketCount)
 	)
 
 	for _, s := range samples {
@@ -353,6 +401,9 @@ func buildSnapshot(key AvailabilityKey, samples []AvailabilitySample, from, to t
 			if s.RateLimited {
 				rateLimited++
 			}
+			if s.NetworkError {
+				networkErrors++
+			}
 		} else {
 			success++
 		}
@@ -362,13 +413,22 @@ func buildSnapshot(key AvailabilityKey, samples []AvailabilitySample, from, to t
 		if s.TTFT > 0 {
 			ttfts = append(ttfts, float64(s.TTFT)/float64(time.Millisecond))
 		}
+		if s.TotalTokens > 0 {
+			totalTokens += s.TotalTokens
+		} else if s.InputTokens > 0 || s.OutputTokens > 0 {
+			// Samples persisted before total_tokens was introduced can still be
+			// represented using their input/output counters.
+			totalTokens += s.InputTokens + s.OutputTokens
+		}
 		if s.OutputTokens > 0 && s.Latency > 0 {
 			// Prefer generation time after first token when available.
 			gen := s.Latency
 			if s.TTFT > 0 && s.Latency > s.TTFT {
 				gen = s.Latency - s.TTFT
 			}
-			if gen > 0 {
+			// Require at least 100ms of generation time to avoid TPS explosion
+			// when latency ≈ TTFT (short responses where first token ≈ last token).
+			if gen >= 100*time.Millisecond {
 				outTokens += float64(s.OutputTokens)
 				genSeconds += gen.Seconds()
 			}
@@ -445,28 +505,32 @@ func buildSnapshot(key AvailabilityKey, samples []AvailabilitySample, from, to t
 	}
 
 	return AvailabilitySnapshot{
-		Key:          key,
-		Window:       window.String(),
-		From:         from,
-		To:           to,
-		Total:        total,
-		Success:      success,
-		Failed:       failed,
-		RateLimited:  rateLimited,
-		Excluded:     excluded,
-		SuccessRate:  round4(successRate),
-		Availability: round4(availability),
-		LatencyP50MS: round2(percentile(latencies, 0.50)),
-		LatencyP95MS: round2(percentile(latencies, 0.95)),
-		TTFTP50MS:    round2(percentile(ttfts, 0.50)),
-		TTFTP95MS:    round2(percentile(ttfts, 0.95)),
-		TPS:          round2(tps),
-		CacheHitRate: round4(cacheHit),
-		HasTraffic:   total > 0,
-		Buckets:      buckets,
-		LastSampleAt: lastSample,
-		LastErrorAt:  lastError,
-		Status:       status,
+		Key:           key,
+		Window:        window.String(),
+		From:          from,
+		To:            to,
+		Total:         total,
+		Success:       success,
+		Failed:        failed,
+		RateLimited:   rateLimited,
+		NetworkErrors: networkErrors,
+		Excluded:      excluded,
+		SuccessRate:   round4(successRate),
+		Availability:  round4(availability),
+		LatencyP50MS:  round2(percentile(latencies, 0.50)),
+		LatencyP95MS:  round2(percentile(latencies, 0.95)),
+		TTFTP50MS:     round2(percentile(ttfts, 0.50)),
+		TTFTP95MS:     round2(percentile(ttfts, 0.95)),
+		TPS:           round2(tps),
+		InputTokens:   inputs,
+		TotalTokens:   totalTokens,
+		CachedTokens:  cached,
+		CacheHitRate:  round4(cacheHit),
+		HasTraffic:    total > 0,
+		Buckets:       buckets,
+		LastSampleAt:  lastSample,
+		LastErrorAt:   lastError,
+		Status:        status,
 	}
 }
 
@@ -508,6 +572,33 @@ var (
 // DefaultAvailabilityAggregator returns the process-wide aggregator.
 func DefaultAvailabilityAggregator() *AvailabilityAggregator {
 	return defaultAvailability
+}
+
+// AvailabilityRetention returns the retention window of the process-wide aggregator.
+func AvailabilityRetention() time.Duration {
+	return defaultAvailability.Retention()
+}
+
+// ConfigureDefaultAvailability adjusts the process-wide aggregator retention and
+// per-key sample cap. It is safe to call before or after plugin registration
+// because it mutates the shared instance instead of replacing it.
+// A maxSamples <= 0 derives the cap from the retention so longer windows keep
+// enough samples to stay accurate (4096 per 24h of retention, minimum 4096).
+func ConfigureDefaultAvailability(retention time.Duration, maxSamples int) {
+	if retention > 0 {
+		defaultAvailability.SetRetention(retention)
+	}
+	if maxSamples <= 0 {
+		multiplier := 1
+		if retention > 0 && retention > DefaultAvailabilityRetention {
+			multiplier = int(retention / DefaultAvailabilityRetention)
+			if multiplier < 1 {
+				multiplier = 1
+			}
+		}
+		maxSamples = multiplier * maxSamplesPerKey
+	}
+	defaultAvailability.SetMaxSamples(maxSamples)
 }
 
 // EnsureAvailabilityPluginRegistered registers the default aggregator on the usage manager once.

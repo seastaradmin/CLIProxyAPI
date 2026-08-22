@@ -102,9 +102,21 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 	antigravityTransportOnce.Do(initAntigravityTransport)
 
 	client := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, timeout)
-	// If no transport is set, use the shared HTTP/1.1 transport.
-	if client.Transport == nil {
-		client.Transport = antigravityTransport
+	// NewProxyAwareHTTPClient may create a default transport solely to apply the
+	// response-header timeout. Keep the shared Antigravity transport in that case;
+	// replace it only when a proxy or caller-supplied round tripper is intentional.
+	hasAuthProxy := auth != nil && strings.TrimSpace(auth.ProxyURL) != ""
+	hasConfigProxy := cfg != nil && strings.TrimSpace(cfg.ProxyURL) != ""
+	hasContextTransport := ctx != nil && ctx.Value("cliproxy.roundtripper") != nil
+	if !hasAuthProxy && !hasConfigProxy && !hasContextTransport {
+		responseHeaderTimeout := time.Duration(0)
+		if transport, ok := client.Transport.(*http.Transport); ok && transport != nil {
+			responseHeaderTimeout = transport.ResponseHeaderTimeout
+		}
+		client.Transport = cloneTransportWithHTTP11(antigravityTransport)
+		if transport, ok := client.Transport.(*http.Transport); ok && responseHeaderTimeout > 0 {
+			transport.ResponseHeaderTimeout = responseHeaderTimeout
+		}
 		return client
 	}
 

@@ -130,6 +130,16 @@ usage-statistics-enabled: false
 # Default: 60. Max: 3600.
 redis-usage-queue-retention-seconds: 60
 
+# How many hours of availability metrics (success rate, latency, token totals)
+# are kept for the monitoring UI. The selectable monitoring window is capped at
+# this value, so values above 24 enable long-range windows such as 7d/30d.
+# Default: 24. Max: 720.
+availability-retention-hours: 24
+
+# How many days of durable request journal (JSONL under logs/request-journal,
+# includes per-request token detail) are retained. Default: 30.
+request-journal-keep-days: 30
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""
@@ -531,6 +541,14 @@ nonstream-keepalive-interval: 0
 #     - "kimi-k2-thinking"
 #   xai:
 #     - "grok-3-mini"
+
+# Disable entire OAuth/file-backed channels by provider key.
+# All auth records whose Provider matches a listed key are excluded from
+# routing and availability checks. Supported channels: vertex, aistudio,
+# antigravity, claude, codex, kimi, xai.
+# oauth-disabled-channels:
+#   codex: true
+#   kimi: true
 
 # Optional payload configuration
 # payload:

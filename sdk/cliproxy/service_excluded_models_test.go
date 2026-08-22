@@ -238,13 +238,13 @@ func TestRegisterModelsForAuth_AntigravityUsesAuthoritativeUpstreamModels(t *tes
 						"maxTokens": 1,
 						"maxOutputTokens": 2
 					},
-					"gemini-3.6-flash": {
+					"gemini-3.6-flash-low": {
 						"displayName": "Gemini 3.6 Flash",
 						"maxTokens": 1048576,
 						"maxOutputTokens": 65536
 					}
 				},
-				"webSearchModelIds": ["gemini-3.6-flash"]
+				"webSearchModelIds": ["gemini-3.6-flash-low"]
 			}`))
 	}))
 	defer server.Close()
@@ -275,56 +275,45 @@ func TestRegisterModelsForAuth_AntigravityUsesAuthoritativeUpstreamModels(t *tes
 	}
 
 	models := registry.GetModelsForClient(auth.ID)
-	staticModels := internalregistry.GetAntigravityModels()
-	staticByID := make(map[string]*internalregistry.ModelInfo, len(staticModels))
-	for _, model := range staticModels {
-		if model != nil {
-			staticByID[model.ID] = model
-		}
-	}
 
 	if len(models) != 2 {
 		t.Fatalf("registered models = %d, want exactly upstream model count 2: %#v", len(models), models)
 	}
 
-	var staticModel, fetchedModel, staticOnlyModel *internalregistry.ModelInfo
+	var fetchedLiteModel, fetchedLowModel, staticOnlyModel *internalregistry.ModelInfo
 	for _, model := range models {
 		if model == nil {
 			continue
 		}
 		switch strings.TrimSpace(model.ID) {
 		case "gemini-3.1-flash-lite":
-			staticModel = model
-		case "gemini-3.6-flash":
-			fetchedModel = model
+			fetchedLiteModel = model
+		case "gemini-3.6-flash-low":
+			fetchedLowModel = model
 		case "gpt-oss-120b-medium":
 			staticOnlyModel = model
 		}
 	}
-	if staticModel == nil {
+	if fetchedLiteModel == nil {
 		t.Fatal("expected gemini-3.1-flash-lite to be registered")
 	}
-	if staticModel.SupportsWebSearch {
+	if fetchedLiteModel.SupportsWebSearch {
 		t.Fatal("expected gemini-3.1-flash-lite to be absent from web search model ids")
 	}
-	staticWebSearchModel := staticByID["gemini-3.1-flash-lite"]
-	if staticWebSearchModel == nil {
-		t.Fatal("expected static gemini-3.1-flash-lite definition")
+	if fetchedLiteModel.ContextLength != 1 || fetchedLiteModel.MaxCompletionTokens != 2 {
+		t.Fatalf("upstream token limits should win, got=%#v", fetchedLiteModel)
 	}
-	if staticModel.ContextLength != 1 || staticModel.MaxCompletionTokens != 2 {
-		t.Fatalf("official token limits should win, got=%#v", staticModel)
+	if fetchedLiteModel.Thinking != nil {
+		t.Fatalf("static metadata should not be supplemented, got thinking=%#v", fetchedLiteModel.Thinking)
 	}
-	if staticModel.Thinking == nil {
-		t.Fatal("expected static thinking metadata to be preserved")
+	if fetchedLowModel == nil {
+		t.Fatal("expected upstream gemini-3.6-flash-low to be registered")
 	}
-	if fetchedModel == nil {
-		t.Fatal("expected upstream-only gemini-3.6-flash to be registered")
+	if !fetchedLowModel.SupportsWebSearch {
+		t.Fatal("expected gemini-3.6-flash-low to support web search")
 	}
-	if !fetchedModel.SupportsWebSearch {
-		t.Fatal("expected gemini-3.6-flash to support web search")
-	}
-	if fetchedModel.ContextLength != 1048576 || fetchedModel.MaxCompletionTokens != 65536 {
-		t.Fatalf("upstream-only model token metadata = %#v", fetchedModel)
+	if fetchedLowModel.ContextLength != 1048576 || fetchedLowModel.MaxCompletionTokens != 65536 {
+		t.Fatalf("upstream model token metadata = %#v", fetchedLowModel)
 	}
 	if staticOnlyModel != nil {
 		t.Fatalf("static-only model should not be registered: %#v", staticOnlyModel)

@@ -1,6 +1,7 @@
 package management
 
 import (
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -20,30 +21,75 @@ func init() {
 }
 
 type availabilityGroup struct {
-	Provider     string  `json:"provider"`
-	Supplier     string  `json:"supplier,omitempty"`
-	Models       int     `json:"models"`
-	Auths        int     `json:"auths,omitempty"`
-	Total        int64   `json:"total"`
-	Success      int64   `json:"success"`
-	Failed       int64   `json:"failed"`
-	RateLimited  int64   `json:"rate_limited"`
-	Availability float64 `json:"availability"`
-	LatencyP50MS float64 `json:"latency_p50_ms"`
-	TTFTP50MS    float64 `json:"ttft_p50_ms"`
-	TPS          float64 `json:"tps"`
-	CacheHitRate float64 `json:"cache_hit_rate"`
-	Status       string  `json:"status"`
-	HasTraffic   bool    `json:"has_traffic"`
-	IdleModels   int     `json:"idle_models"`
+	Provider      string  `json:"provider"`
+	Supplier      string  `json:"supplier,omitempty"`
+	Models        int     `json:"models"`
+	Auths         int     `json:"auths,omitempty"`
+	Total         int64   `json:"total"`
+	Success       int64   `json:"success"`
+	Failed        int64   `json:"failed"`
+	RateLimited   int64   `json:"rate_limited"`
+	NetworkErrors int64   `json:"network_errors"`
+	Availability  float64 `json:"availability"`
+	LatencyP50MS  float64 `json:"latency_p50_ms"`
+	TTFTP50MS     float64 `json:"ttft_p50_ms"`
+	TPS           float64 `json:"tps"`
+	InputTokens   int64   `json:"input_tokens"`
+	TotalTokens   int64   `json:"total_tokens"`
+	CachedTokens  int64   `json:"cached_tokens"`
+	CacheHitRate  float64 `json:"cache_hit_rate"`
+	Status        string  `json:"status"`
+	HasTraffic    bool    `json:"has_traffic"`
+	IdleModels    int     `json:"idle_models"`
+
+	// Recent* accumulate the trailing 5-minute buckets only (independent of the
+	// selected display window) so Status reflects the current moment instead of
+	// the whole window.
+	RecentTotal       int64 `json:"-"`
+	RecentSuccess     int64 `json:"-"`
+	RecentRateLimited int64 `json:"-"`
 }
 
-func aggregateAvailabilityGroups(items []coreusage.AvailabilitySnapshot) []availabilityGroup {
+// recentBucketCounts sums the last n buckets of a snapshot. Buckets have a
+// fixed 5-minute granularity regardless of the requested window, so the
+// trailing buckets always cover the same recent period.
+func recentBucketCounts(buckets []coreusage.AvailabilityBucket, n int) (total, success, rateLimited int64) {
+	if len(buckets) == 0 {
+		return 0, 0, 0
+	}
+	if n <= 0 || n > len(buckets) {
+		n = len(buckets)
+	}
+	for _, b := range buckets[len(buckets)-n:] {
+		total += b.Total
+		success += b.Success
+		rateLimited += b.RateLimited
+	}
+	return total, success, rateLimited
+}
+
+// availabilityGroupStatus derives the current health status from the recent
+// (last 10 minutes) buckets plus the live credential cooldown signal. Status is
+// intentionally independent of the selected display window.
+func availabilityGroupStatus(total, success, rateLimited int64, cooling bool) string {
+	if rateLimited > 0 || cooling {
+		// Run-limit / quota: the credential set is in (or just exited) cooldown.
+		return "cooldown"
+	}
+	if total > 0 {
+		if float64(success)/float64(total) < 0.95 {
+			return "degraded"
+		}
+		return "running"
+	}
+	return "no_data"
+}
+
+func aggregateAvailabilityGroups(items []coreusage.AvailabilitySnapshot, coolingProviders map[string]bool) []availabilityGroup {
 	groupsMap := map[string]*availabilityGroup{}
 	latencySum := map[string]float64{}
 	ttftSum := map[string]float64{}
 	tpsSum := map[string]float64{}
-	cacheSum := map[string]float64{}
 	metricN := map[string]int{}
 
 	for _, snap := range items {
@@ -60,6 +106,14 @@ func aggregateAvailabilityGroups(items []coreusage.AvailabilitySnapshot) []avail
 		g.Success += snap.Success
 		g.Failed += snap.Failed
 		g.RateLimited += snap.RateLimited
+		g.NetworkErrors += snap.NetworkErrors
+		rt, rs, rl := recentBucketCounts(snap.Buckets, 2)
+		g.RecentTotal += rt
+		g.RecentSuccess += rs
+		g.RecentRateLimited += rl
+		g.InputTokens += snap.InputTokens
+		g.TotalTokens += snap.TotalTokens
+		g.CachedTokens += snap.CachedTokens
 		if snap.HasTraffic {
 			g.Models++
 			g.HasTraffic = true
@@ -70,7 +124,6 @@ func aggregateAvailabilityGroups(items []coreusage.AvailabilitySnapshot) []avail
 			latencySum[p] += snap.LatencyP50MS
 			ttftSum[p] += snap.TTFTP50MS
 			tpsSum[p] += snap.TPS
-			cacheSum[p] += snap.CacheHitRate
 			metricN[p]++
 		}
 	}
@@ -78,19 +131,17 @@ func aggregateAvailabilityGroups(items []coreusage.AvailabilitySnapshot) []avail
 	for p, g := range groupsMap {
 		if g.Total > 0 {
 			g.Availability = float64(g.Success) / float64(g.Total)
-			g.Status = "running"
-			if g.Availability < 0.95 || g.RateLimited > 0 {
-				g.Status = "degraded"
-			}
-		} else {
-			g.Status = "no_data"
-			g.Availability = 0
 		}
+		g.Status = availabilityGroupStatus(g.RecentTotal, g.RecentSuccess, g.RecentRateLimited, coolingProviders[p])
 		if n := metricN[p]; n > 0 {
 			g.LatencyP50MS = latencySum[p] / float64(n)
 			g.TTFTP50MS = ttftSum[p] / float64(n)
 			g.TPS = tpsSum[p] / float64(n)
-			g.CacheHitRate = cacheSum[p] / float64(n)
+		}
+		// Weight cache hit by input volume; equal-weighting per-model rates lets
+		// low-volume probe traffic dominate a supplier's real usage.
+		if g.InputTokens > 0 {
+			g.CacheHitRate = cacheHitRate(g.CachedTokens, g.InputTokens)
 		}
 		groups = append(groups, *g)
 	}
@@ -114,7 +165,6 @@ func aggregateAvailabilitySupplierGroups(items []coreusage.AvailabilitySnapshot)
 	latencySum := map[string]float64{}
 	ttftSum := map[string]float64{}
 	tpsSum := map[string]float64{}
-	cacheSum := map[string]float64{}
 	metricN := map[string]int{}
 
 	for _, snap := range items {
@@ -132,6 +182,14 @@ func aggregateAvailabilitySupplierGroups(items []coreusage.AvailabilitySnapshot)
 		g.Success += snap.Success
 		g.Failed += snap.Failed
 		g.RateLimited += snap.RateLimited
+		g.NetworkErrors += snap.NetworkErrors
+		rt, rs, rl := recentBucketCounts(snap.Buckets, 2)
+		g.RecentTotal += rt
+		g.RecentSuccess += rs
+		g.RecentRateLimited += rl
+		g.InputTokens += snap.InputTokens
+		g.TotalTokens += snap.TotalTokens
+		g.CachedTokens += snap.CachedTokens
 		if snap.HasTraffic {
 			g.Models++
 			g.HasTraffic = true
@@ -149,7 +207,6 @@ func aggregateAvailabilitySupplierGroups(items []coreusage.AvailabilitySnapshot)
 			latencySum[s] += snap.LatencyP50MS
 			ttftSum[s] += snap.TTFTP50MS
 			tpsSum[s] += snap.TPS
-			cacheSum[s] += snap.CacheHitRate
 			metricN[s]++
 		}
 	}
@@ -158,19 +215,16 @@ func aggregateAvailabilitySupplierGroups(items []coreusage.AvailabilitySnapshot)
 		g.Auths = len(authSeen[s])
 		if g.Total > 0 {
 			g.Availability = float64(g.Success) / float64(g.Total)
-			g.Status = "running"
-			if g.Availability < 0.95 || g.RateLimited > 0 {
-				g.Status = "degraded"
-			}
-		} else {
-			g.Status = "no_data"
-			g.Availability = 0
 		}
+		g.Status = availabilityGroupStatus(g.RecentTotal, g.RecentSuccess, g.RecentRateLimited, false)
 		if n := metricN[s]; n > 0 {
 			g.LatencyP50MS = latencySum[s] / float64(n)
 			g.TTFTP50MS = ttftSum[s] / float64(n)
 			g.TPS = tpsSum[s] / float64(n)
-			g.CacheHitRate = cacheSum[s] / float64(n)
+		}
+		// Keep supplier groups on the same token-weighted cache-hit definition.
+		if g.InputTokens > 0 {
+			g.CacheHitRate = cacheHitRate(g.CachedTokens, g.InputTokens)
 		}
 		groups = append(groups, *g)
 	}
@@ -207,16 +261,18 @@ func (h *Handler) GetAvailability(c *gin.Context) {
 	coreusage.EnsureAvailabilityPluginRegistered()
 	snapshots := agg.Snapshot(now, window, bucketCount)
 
+	registered := h.registeredAvailabilityKeys()
+	snapshots = reconcileAvailabilitySnapshots(snapshots, registered)
+
 	// Index live traffic snapshots by stable key id.
 	byID := make(map[string]coreusage.AvailabilitySnapshot, len(snapshots))
 	for _, snap := range snapshots {
-		snap.Key.Provider = normalizeAvailabilityProvider(snap.Key.Provider)
 		byID[availabilityKeyID(snap.Key)] = snap
 	}
 
 	// Seed missing registered channel×model pairs as no_data, and attach protocols
 	// metadata onto existing traffic snapshots when available.
-	for _, key := range h.registeredAvailabilityKeys() {
+	for _, key := range registered {
 		id := availabilityKeyID(key)
 		if snap, ok := byID[id]; ok {
 			changed := false
@@ -239,7 +295,7 @@ func (h *Handler) GetAvailability(c *gin.Context) {
 	}
 
 	items := make([]coreusage.AvailabilitySnapshot, 0, len(byID))
-	var totalReq, totalOK int64
+	var totalReq, totalOK, inputTokens, totalTokens, cachedTokens, networkErrors int64
 	for _, snap := range byID {
 		if providerFilter != "" && !strings.EqualFold(snap.Key.Provider, providerFilter) {
 			continue
@@ -265,6 +321,10 @@ func (h *Handler) GetAvailability(c *gin.Context) {
 		items = append(items, snap)
 		totalReq += snap.Total
 		totalOK += snap.Success
+		inputTokens += snap.InputTokens
+		totalTokens += snap.TotalTokens
+		cachedTokens += snap.CachedTokens
+		networkErrors += snap.NetworkErrors
 	}
 
 	sort.Slice(items, func(i, j int) bool {
@@ -289,8 +349,29 @@ func (h *Handler) GetAvailability(c *gin.Context) {
 		overall = float64(totalOK) / float64(totalReq)
 	}
 
+	// Live credential cooldown signal: a provider whose credentials are still
+	// cooling (quota/rate-limit) shows a cooldown status regardless of window.
+	coolingProviders := map[string]bool{}
+	if h.authManager != nil {
+		coolNow := time.Now()
+		for _, auth := range h.authManager.List() {
+			if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+				continue
+			}
+			cooling := (auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(coolNow)) ||
+				(auth.Unavailable && auth.NextRetryAfter.After(coolNow))
+			if !cooling {
+				continue
+			}
+			provider := normalizeAvailabilityProvider(strings.TrimSpace(auth.Provider))
+			if provider != "" {
+				coolingProviders[provider] = true
+			}
+		}
+	}
+
 	// Group by provider (channel family) and supplier label for card-wall summary.
-	groups := aggregateAvailabilityGroups(items)
+	groups := aggregateAvailabilityGroups(items, coolingProviders)
 	supplierGroups := aggregateAvailabilitySupplierGroups(items)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -300,6 +381,11 @@ func (h *Handler) GetAvailability(c *gin.Context) {
 		"overall_availability": overall,
 		"total_requests":       totalReq,
 		"total_success":        totalOK,
+		"network_errors":       networkErrors,
+		"input_tokens":         inputTokens,
+		"total_tokens":         totalTokens,
+		"cached_tokens":        cachedTokens,
+		"cache_hit_rate":       cacheHitRate(cachedTokens, inputTokens),
 		"include_idle":         includeIdle,
 		"registered_models":    len(items),
 		"groups":               groups,
@@ -329,6 +415,55 @@ func normalizeAvailabilityProvider(provider string) string {
 	return "openai-compatible-" + provider
 }
 
+func cacheHitRate(cachedTokens, inputTokens int64) float64 {
+	if inputTokens <= 0 || cachedTokens <= 0 {
+		return 0
+	}
+	rate := float64(cachedTokens) / float64(inputTokens)
+	if rate > 1 {
+		return 1
+	}
+	return rate
+}
+
+func matchOpenAICompatibilityModelProtocols(list []config.OpenAICompatibilityModel, model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+
+	// Prefer the canonical model name over an alias. Aliases can intentionally
+	// point to multiple upstream models for pooling, so keep their first-match
+	// behavior when no canonical name is present.
+	exactCount := 0
+	var exactProtocols []string
+	for i := range list {
+		m := &list[i]
+		if strings.TrimSpace(m.Name) != "" && strings.EqualFold(strings.TrimSpace(m.Name), model) {
+			exactCount++
+			if len(m.Protocols) > 0 {
+				exactProtocols = append(exactProtocols, util.NormalizeUpstreamProtocols(m.Protocols)...)
+			}
+		}
+	}
+	if exactCount > 0 {
+		if exactCount != 1 || len(exactProtocols) == 0 {
+			return nil
+		}
+		return exactProtocols
+	}
+
+	for i := range list {
+		m := &list[i]
+		if strings.TrimSpace(m.Alias) != "" && strings.EqualFold(strings.TrimSpace(m.Alias), model) {
+			if len(m.Protocols) > 0 {
+				return util.NormalizeUpstreamProtocols(m.Protocols)
+			}
+		}
+	}
+	return nil
+}
+
 func availabilityKeyID(key coreusage.AvailabilityKey) string {
 	provider := normalizeAvailabilityProvider(key.Provider)
 	channel := strings.TrimSpace(key.AuthIndex)
@@ -343,6 +478,90 @@ func availabilityKeyID(key coreusage.AvailabilityKey) string {
 		model = "unknown"
 	}
 	return strings.ToLower(provider) + "\x1f" + channel + "\x1f" + model
+}
+
+func availabilityKeyChannelID(key coreusage.AvailabilityKey) string {
+	provider := normalizeAvailabilityProvider(key.Provider)
+	channel := strings.TrimSpace(key.AuthIndex)
+	if channel == "" {
+		channel = strings.TrimSpace(key.AuthID)
+	}
+	if channel == "" {
+		channel = provider
+	}
+	return strings.ToLower(provider) + "\x1f" + channel
+}
+
+// reconcileAvailabilitySnapshots keeps historical metrics only for currently
+// registered model routes and rewrites stale route metadata to the live value.
+// The aggregator intentionally retains recent history, so it cannot decide
+// whether a model alias is still configured on its own.
+func reconcileAvailabilitySnapshots(
+	snapshots []coreusage.AvailabilitySnapshot,
+	registered []coreusage.AvailabilityKey,
+) []coreusage.AvailabilitySnapshot {
+	current := make(map[string]coreusage.AvailabilityKey, len(registered))
+	for _, key := range registered {
+		key.Provider = normalizeAvailabilityProvider(key.Provider)
+		id := availabilityKeyID(key)
+		if existing, ok := current[id]; ok {
+			if existing.Alias == "" && key.Alias != "" {
+				existing.Alias = key.Alias
+			}
+			if len(existing.Protocols) == 0 && len(key.Protocols) > 0 {
+				existing.Protocols = append([]string(nil), key.Protocols...)
+			}
+			if existing.Supplier == "" && key.Supplier != "" {
+				existing.Supplier = key.Supplier
+			}
+			current[id] = existing
+			continue
+		}
+		current[id] = key
+	}
+
+	currentByRoute := make(map[string]coreusage.AvailabilityKey, len(current)*2)
+	for _, key := range current {
+		channel := availabilityKeyChannelID(key)
+		for _, route := range []string{key.Model, key.Alias} {
+			route = strings.TrimSpace(route)
+			if route == "" {
+				continue
+			}
+			currentByRoute[channel+"\x1f"+strings.ToLower(route)] = key
+		}
+	}
+
+	byID := make(map[string]coreusage.AvailabilitySnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		snapshot.Key.Provider = normalizeAvailabilityProvider(snapshot.Key.Provider)
+		id := availabilityKeyID(snapshot.Key)
+		live, ok := current[id]
+		if !ok && strings.TrimSpace(snapshot.Key.Alias) != "" {
+			live, ok = currentByRoute[availabilityKeyChannelID(snapshot.Key)+"\x1f"+strings.ToLower(strings.TrimSpace(snapshot.Key.Alias))]
+		}
+		if !ok {
+			continue
+		}
+		// Keep the measurements, but never expose an alias that was removed or
+		// replaced while those measurements were still inside the retention window.
+		snapshot.Key.Provider = live.Provider
+		snapshot.Key.Model = live.Model
+		snapshot.Key.Alias = live.Alias
+		if len(snapshot.Key.Protocols) == 0 && len(live.Protocols) > 0 {
+			snapshot.Key.Protocols = append([]string(nil), live.Protocols...)
+		}
+		if snapshot.Key.Supplier == "" && live.Supplier != "" {
+			snapshot.Key.Supplier = live.Supplier
+		}
+		byID[availabilityKeyID(live)] = snapshot
+	}
+
+	result := make([]coreusage.AvailabilitySnapshot, 0, len(byID))
+	for _, snapshot := range byID {
+		result = append(result, snapshot)
+	}
+	return result
 }
 
 // registeredAvailabilityKeys walks auth manager + model registry and returns every
@@ -397,20 +616,6 @@ func (h *Handler) registeredAvailabilityKeys() []coreusage.AvailabilityKey {
 		model = strings.TrimSpace(model)
 		baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 		authAPIKey = strings.TrimSpace(authAPIKey)
-		matchModelProtocols := func(list []config.OpenAICompatibilityModel) []string {
-			for j := range list {
-				m := &list[j]
-				actual := strings.TrimSpace(m.Name)
-				alias := strings.TrimSpace(m.Alias)
-				if (actual != "" && strings.EqualFold(actual, model)) ||
-					(alias != "" && strings.EqualFold(alias, model)) {
-					if len(m.Protocols) > 0 {
-						return util.NormalizeUpstreamProtocols(m.Protocols)
-					}
-				}
-			}
-			return nil
-		}
 		// Collect candidates by name/provider first; prefer baseURL match when present.
 		type cand struct {
 			protocols []string
@@ -440,17 +645,17 @@ func (h *Handler) registeredAvailabilityKeys() []coreusage.AvailabilityKey {
 			if authAPIKey != "" {
 				for k := range compat.APIKeyEntries {
 					if strings.TrimSpace(compat.APIKeyEntries[k].APIKey) == authAPIKey {
-						modelProtocols = matchModelProtocols(compat.APIKeyEntries[k].Models)
+						modelProtocols = matchOpenAICompatibilityModelProtocols(compat.APIKeyEntries[k].Models, model)
 						break
 					}
 				}
 			}
 			if modelProtocols == nil {
-				modelProtocols = matchModelProtocols(compat.Models)
+				modelProtocols = matchOpenAICompatibilityModelProtocols(compat.Models, model)
 			}
 			if modelProtocols == nil {
 				for k := range compat.APIKeyEntries {
-					if p := matchModelProtocols(compat.APIKeyEntries[k].Models); p != nil {
+					if p := matchOpenAICompatibilityModelProtocols(compat.APIKeyEntries[k].Models, model); p != nil {
 						modelProtocols = p
 						break
 					}
@@ -755,14 +960,31 @@ func parseAvailabilityWindow(raw string) time.Duration {
 	if raw == "" {
 		return coreusage.DefaultAvailabilityWindow
 	}
-	d, err := time.ParseDuration(raw)
+	d, err := parseDurationWithDays(raw)
 	if err != nil || d <= 0 {
 		return coreusage.DefaultAvailabilityWindow
 	}
-	if d > 24*time.Hour {
-		return 24 * time.Hour
+	// The selectable window cannot exceed the aggregator retention; the default
+	// retention is 24h and can be widened via availability-retention-hours.
+	if max := coreusage.AvailabilityRetention(); d > max {
+		return max
 	}
 	return d
+}
+
+// parseDurationWithDays parses Go duration strings and additionally supports
+// the day unit ("d") used by the monitoring UI window selector, e.g. "7d" -> 168h.
+func parseDurationWithDays(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	lower := strings.ToLower(raw)
+	if strings.HasSuffix(lower, "d") {
+		days, err := strconv.ParseInt(strings.TrimSpace(lower[:len(lower)-1]), 10, 64)
+		if err != nil || days <= 0 {
+			return 0, errors.New("invalid day duration")
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(raw)
 }
 
 func parseAvailabilityBuckets(raw string) int {

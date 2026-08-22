@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -624,4 +625,160 @@ type TestUsageExecutor struct{}
 
 func (TestUsageExecutor) Identifier() string {
 	return "test-provider"
+}
+
+func TestParseOpenAIUsageAnthropicMessagesBody(t *testing.T) {
+	// Non-stream /v1/messages responses nest usage under message.usage
+	// using Anthropic field names; cached tokens must not be lost.
+	data := []byte(`{"id":"msg_1","type":"message","role":"assistant","usage":{"input_tokens":25,"output_tokens":414,"cache_creation_input_tokens":96,"cache_read_input_tokens":92900}}`)
+	detail := ParseOpenAIUsage(data)
+	if detail.InputTokens != 25 || detail.OutputTokens != 414 {
+		t.Fatalf("tokens input=%d output=%d", detail.InputTokens, detail.OutputTokens)
+	}
+	if detail.CachedTokens != 92900 || detail.CacheReadTokens != 92900 {
+		t.Fatalf("cached=%d cacheRead=%d, want 92900", detail.CachedTokens, detail.CacheReadTokens)
+	}
+	if detail.CacheCreationTokens != 96 {
+		t.Fatalf("cache creation=%d, want 96", detail.CacheCreationTokens)
+	}
+	if detail.TotalTokens != 25+414+96+92900 {
+		t.Fatalf("total=%d, want %d", detail.TotalTokens, 25+414+96+92900)
+	}
+	if !detail.TokenBreakdown.Valid() {
+		t.Fatalf("token breakdown should be valid: %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseOpenAIUsageTopLevelAnthropicUsage(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":5}}`)
+	detail := ParseOpenAIUsage(data)
+	if detail.CachedTokens != 5 || detail.CacheReadTokens != 5 {
+		t.Fatalf("cached=%d cacheRead=%d, want 5", detail.CachedTokens, detail.CacheReadTokens)
+	}
+}
+
+func TestStreamUsageBufferAnthropicMessagesEvents(t *testing.T) {
+	// Anthropic SSE splits usage across events: message_start nests it under
+	// message.usage (input + cache), message_delta reports output tokens at the
+	// top level. The merged final detail must keep both sides.
+	var buffer StreamUsageBuffer
+	buffer.ObserveOpenAIStream([]byte(`event: message_start`))
+	buffer.ObserveOpenAIStream([]byte(`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":25,"cache_creation_input_tokens":96,"cache_read_input_tokens":92900,"output_tokens":1}}}`))
+	buffer.ObserveOpenAIStream([]byte(`data: {"type":"message_delta","usage":{"output_tokens":414}}`))
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected observed usage")
+	}
+	if detail.InputTokens != 25 || detail.OutputTokens != 414 {
+		t.Fatalf("tokens input=%d output=%d", detail.InputTokens, detail.OutputTokens)
+	}
+	if detail.CachedTokens != 92900 || detail.CacheReadTokens != 92900 {
+		t.Fatalf("cached=%d cacheRead=%d, want 92900", detail.CachedTokens, detail.CacheReadTokens)
+	}
+	if detail.CacheCreationTokens != 96 {
+		t.Fatalf("cache creation=%d, want 96", detail.CacheCreationTokens)
+	}
+	if detail.TotalTokens != 25+414+96+92900 {
+		t.Fatalf("total=%d, want %d", detail.TotalTokens, 25+414+96+92900)
+	}
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Input.CacheReadTokens != 92900 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestStreamUsageBufferOpenAIStreamUnchanged(t *testing.T) {
+	// OpenAI-style streams must keep working: final usage chunk wins.
+	var buffer StreamUsageBuffer
+	buffer.ObserveOpenAIStream([]byte(`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":40}}}`))
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected observed usage")
+	}
+	if detail.InputTokens != 100 || detail.OutputTokens != 20 || detail.CachedTokens != 40 {
+		t.Fatalf("detail = %+v", detail)
+	}
+}
+
+func TestStreamUsageBufferResponsesAPIUsage(t *testing.T) {
+	// Responses API nests usage under response.usage with input_tokens and
+	// input_tokens_details; it must stay on the OpenAI-style path.
+	var buffer StreamUsageBuffer
+	buffer.ObserveOpenAIStream([]byte(`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":500,"input_tokens_details":{"cached_tokens":320},"output_tokens":42,"output_tokens_details":{"reasoning_tokens":10},"total_tokens":542}}}`))
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected observed usage")
+	}
+	if detail.InputTokens != 500 || detail.OutputTokens != 42 {
+		t.Fatalf("tokens input=%d output=%d", detail.InputTokens, detail.OutputTokens)
+	}
+	if detail.CachedTokens != 320 || detail.CacheReadTokens != 320 {
+		t.Fatalf("cached=%d cacheRead=%d, want 320", detail.CachedTokens, detail.CacheReadTokens)
+	}
+	if detail.ReasoningTokens != 10 {
+		t.Fatalf("reasoning=%d, want 10", detail.ReasoningTokens)
+	}
+}
+
+func TestStreamUsageBufferCompatInputTokensWithDetails(t *testing.T) {
+	// Some OpenAI-compat upstreams report chat usage with input_tokens and
+	// nested input_tokens_details; the *_details buckets must win over the
+	// Anthropic-style heuristic.
+	var buffer StreamUsageBuffer
+	buffer.ObserveOpenAIStream([]byte(`data: {"choices":[],"usage":{"input_tokens":1000,"output_tokens":50,"total_tokens":1050,"input_tokens_details":{"cached_tokens":400}}}`))
+	detail, ok := buffer.Detail()
+	if !ok {
+		t.Fatal("expected observed usage")
+	}
+	if detail.InputTokens != 1000 || detail.OutputTokens != 50 {
+		t.Fatalf("tokens input=%d output=%d", detail.InputTokens, detail.OutputTokens)
+	}
+	if detail.CachedTokens != 400 || detail.CacheReadTokens != 400 {
+		t.Fatalf("cached=%d cacheRead=%d, want 400", detail.CachedTokens, detail.CacheReadTokens)
+	}
+}
+
+func TestFailFromErrorsMarksNetworkError(t *testing.T) {
+	// Transport-level failure (dial timeout) carries no status and must be
+	// flagged as a network error.
+	dialErr := &url.Error{Op: "Post", URL: "https://upstream", Err: context.DeadlineExceeded}
+	fail := failFromErrors(dialErr)
+	if !fail.NetworkError {
+		t.Fatalf("dial timeout should be a network error: %+v", fail)
+	}
+	if fail.StatusCode != 0 {
+		t.Fatalf("network error status = %d, want 0", fail.StatusCode)
+	}
+
+	// Client cancellation maps to 499 and is NOT a network error.
+	fail = failFromErrors(context.Canceled)
+	if fail.NetworkError {
+		t.Fatalf("client cancel must not be a network error: %+v", fail)
+	}
+	if fail.StatusCode != 499 {
+		t.Fatalf("client cancel status = %d, want 499", fail.StatusCode)
+	}
+
+	// A real HTTP status (rate limit) is not a network error.
+	fail = failFromErrors(testStatusError{code: 429, msg: "rate limited"})
+	if fail.NetworkError {
+		t.Fatalf("http status error must not be a network error: %+v", fail)
+	}
+	if fail.StatusCode != 429 {
+		t.Fatalf("status = %d, want 429", fail.StatusCode)
+	}
+}
+
+type testStatusError struct {
+	code int
+	msg  string
+}
+
+func (e testStatusError) Error() string   { return e.msg }
+func (e testStatusError) StatusCode() int { return e.code }
+
+func TestFailFromErrorsMarksReadResetAsNetwork(t *testing.T) {
+	fail := failFromErrors(io.ErrUnexpectedEOF)
+	if !fail.NetworkError {
+		t.Fatalf("unexpected EOF should be a network error: %+v", fail)
+	}
 }

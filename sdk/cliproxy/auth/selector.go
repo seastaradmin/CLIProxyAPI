@@ -296,14 +296,74 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return available, nil
 }
 
+// preferProtocolPassthrough filters available auths to those that natively support
+// the client's protocol for the given model (passthrough tier). If no auth supports
+// it natively, returns the original list unchanged (translation fallback tier).
+func preferProtocolPassthrough(available []*Auth, model string, opts cliproxyexecutor.Options) []*Auth {
+	if len(available) <= 1 || model == "" {
+		return available
+	}
+	clientProto := clientFormatToProtocol(opts.SourceFormat.String())
+	if clientProto == "" {
+		return available
+	}
+	modelKey := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if modelKey == "" {
+		return available
+	}
+	attrKey := "model_proto:" + modelKey
+	passthrough := make([]*Auth, 0, len(available))
+	for _, auth := range available {
+		if auth == nil || auth.Attributes == nil {
+			continue
+		}
+		protos := auth.Attributes[attrKey]
+		if protos == "" {
+			// No per-model info; check channel-level protocols attribute.
+			protos = auth.Attributes["protocols"]
+		}
+		if protos != "" && hasProtocolInCSV(protos, clientProto) {
+			passthrough = append(passthrough, auth)
+		}
+	}
+	if len(passthrough) > 0 {
+		return passthrough
+	}
+	return available
+}
+
+// clientFormatToProtocol maps a translator format string to a protocol label.
+func clientFormatToProtocol(sourceFormat string) string {
+	switch strings.ToLower(strings.TrimSpace(sourceFormat)) {
+	case "openai-response", "openai-responses":
+		return "responses"
+	case "claude":
+		return "messages"
+	case "openai", "openai-image", "openai-video":
+		return "chat"
+	default:
+		return ""
+	}
+}
+
+// hasProtocolInCSV checks if a comma-separated protocol list contains the target.
+func hasProtocolInCSV(csv, target string) bool {
+	for _, part := range strings.Split(csv, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), target) {
+			return true
+		}
+	}
+	return false
+}
+
 // Pick selects the next available auth for the provider in a round-robin manner.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
+	available = preferProtocolPassthrough(available, model, opts)
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
@@ -335,12 +395,12 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 
 // Pick selects the first available auth for the provider in a deterministic manner.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
+	available = preferProtocolPassthrough(available, model, opts)
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
 }
@@ -380,7 +440,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						if state.Quota.Exceeded {
 							return true, blockReasonCooldown, next
 						}
-						return true, blockReasonOther, next
+						return true, blockReasonCooldown, next
 					}
 				}
 				return false, blockReasonNone, time.Time{}
@@ -399,7 +459,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		if auth.Quota.Exceeded {
 			return true, blockReasonCooldown, next
 		}
-		return true, blockReasonOther, next
+		return true, blockReasonCooldown, next
 	}
 	return false, blockReasonNone, time.Time{}
 }

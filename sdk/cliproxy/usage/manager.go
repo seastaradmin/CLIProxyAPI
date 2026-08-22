@@ -63,6 +63,10 @@ type Record struct {
 type Failure struct {
 	StatusCode int
 	Body       string
+	// NetworkError marks transport-level failures (DNS, dial, TLS, connect
+	// reset, first-byte timeout) that never produced an HTTP status. These
+	// are attributed to the network environment, not to the credential.
+	NetworkError bool
 }
 
 // Detail holds the token usage breakdown.

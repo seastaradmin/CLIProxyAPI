@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -847,7 +846,7 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError(t *testing.T) {
+func TestExecuteStreamWithAuthManager_ReportsBootstrapRetryModelCooldown(t *testing.T) {
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
@@ -894,22 +893,18 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 	if gotErr == nil {
 		t.Fatalf("expected terminal error")
 	}
-	if gotErr.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusServiceUnavailable)
+	if gotErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusTooManyRequests)
 	}
-
-	var authErr *coreauth.Error
-	if !errors.As(gotErr.Error, &authErr) || authErr == nil {
-		t.Fatalf("expected coreauth.Error, got %T", gotErr.Error)
+	if gotErr.Error == nil {
+		t.Fatalf("expected model cooldown error")
 	}
-	if authErr.Code != "auth_unavailable" {
-		t.Fatalf("code = %q, want %q", authErr.Code, "auth_unavailable")
+	errorText := gotErr.Error.Error()
+	if !strings.Contains(errorText, `"code":"model_cooldown"`) {
+		t.Fatalf("error missing model_cooldown code: %q", errorText)
 	}
-	if !strings.Contains(authErr.Message, "providers=codex") {
-		t.Fatalf("message missing provider context: %q", authErr.Message)
-	}
-	if !strings.Contains(authErr.Message, "model=test-model") {
-		t.Fatalf("message missing model context: %q", authErr.Message)
+	if !strings.Contains(errorText, `"model":"test-model"`) {
+		t.Fatalf("error missing model context: %q", errorText)
 	}
 
 	if executor.Calls() != 1 {
@@ -1155,5 +1150,76 @@ func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t 
 	expectedData := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}"
 	if got[1] != expectedData {
 		t.Fatalf("unexpected second chunk.\nGot:  %q\nWant: %q", got[1], expectedData)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_RetriesBeforeContentAfterMetadata(t *testing.T) {
+	executor := &bootstrapStreamExecutor{stream: func(_ context.Context, call int) (*coreexecutor.StreamResult, error) {
+		chunks := make(chan coreexecutor.StreamChunk, 3)
+		if call == 1 {
+			// First attempt emits only protocol metadata, then dies with a
+			// transport interruption before producing any content.
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m-1\",\"model\":\"claude\"}}\n")}
+			chunks <- coreexecutor.StreamChunk{Err: context.Canceled}
+		} else {
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m-1\",\"model\":\"claude\"}}\n")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n")}
+		}
+		close(chunks)
+		return &coreexecutor.StreamResult{Chunks: chunks}, nil
+	}}
+	handler, _ := registerBootstrapExecutor(t, executor)
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "claude", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if executor.Calls() != 2 {
+		t.Fatalf("stream attempts = %d, want 2 (metadata-only attempt must be retried)", executor.Calls())
+	}
+	if !strings.Contains(string(got), "message_start") || !strings.Contains(string(got), "content_block_delta") {
+		t.Fatalf("stream payload = %q, want metadata + content from the retried attempt", got)
+	}
+	if strings.Count(string(got), "message_start") != 1 {
+		t.Fatalf("stream payload = %q, want exactly one message_start (dropped attempt must not leak)", got)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_DoesNotRetryAfterContent(t *testing.T) {
+	executor := &bootstrapStreamExecutor{stream: func(_ context.Context, _ int) (*coreexecutor.StreamResult, error) {
+		chunks := make(chan coreexecutor.StreamChunk, 3)
+		chunks <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m-1\",\"model\":\"claude\"}}\n")}
+		chunks <- coreexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n")}
+		chunks <- coreexecutor.StreamChunk{Err: context.Canceled}
+		close(chunks)
+		return &coreexecutor.StreamResult{Chunks: chunks}, nil
+	}}
+	handler, _ := registerBootstrapExecutor(t, executor)
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "claude", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	var gotErr error
+	for msg := range errChan {
+		if msg != nil && msg.Error != nil {
+			gotErr = msg.Error
+		}
+	}
+	if executor.Calls() != 1 {
+		t.Fatalf("stream attempts = %d, want 1 (content was already delivered)", executor.Calls())
+	}
+	if !strings.Contains(string(got), "content_block_delta") {
+		t.Fatalf("stream payload = %q, want content delta", got)
+	}
+	if gotErr == nil {
+		t.Fatal("expected terminal error after content was delivered")
 	}
 }

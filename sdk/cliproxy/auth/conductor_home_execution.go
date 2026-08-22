@@ -117,11 +117,6 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			result.RetryAfter = retryAfterFromError(errExecute)
 			m.reportHomeResult(execCtx, result, preparedAuth)
 			lastErr = errExecute
-			if isRequestInvalidError(errExecute) {
-				releaseAttempt()
-				selection.End("request_invalid")
-				return cliproxyexecutor.Response{}, errExecute
-			}
 		}
 		releaseAttempt()
 		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "execution_failed"); errEnd != nil {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
+	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -58,6 +59,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	setGenerateMetadata(reqMeta, rawJSON)
+	setImageFingerprintMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -126,6 +128,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	setGenerateMetadata(reqMeta, rawJSON)
+	setImageFingerprintMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -220,6 +223,7 @@ func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtoco
 	setReasoningEffortMetadata(reqMeta, entryProtocol, modelName, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	setGenerateMetadata(reqMeta, rawJSON)
+	setImageFingerprintMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -236,6 +240,24 @@ func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtoco
 		Metadata:        reqMeta,
 	}
 	return req, opts
+}
+
+func setImageFingerprintMetadata(meta map[string]any, rawJSON []byte) {
+	if meta == nil {
+		return
+	}
+	fingerprints := internalcache.ExtractImageFingerprints(rawJSON)
+	if len(fingerprints) == 0 {
+		return
+	}
+	hits, misses := internalcache.ObserveImageFingerprints(fingerprints)
+	keys := make([]string, 0, len(fingerprints))
+	for _, fingerprint := range fingerprints {
+		keys = append(keys, fingerprint.Key)
+	}
+	meta[coreexecutor.ImageFingerprintsMetadataKey] = keys
+	meta[coreexecutor.ImageFingerprintCacheHitsMetadataKey] = hits
+	meta[coreexecutor.ImageFingerprintCacheMissesMetadataKey] = misses
 }
 
 func (h *BaseAPIHandler) applyRequestInterceptorsAfterPluginExecutorRoute(ctx context.Context, host PluginExecutorHost, executorPluginID, entryProtocol, originalRequestedModel string, req coreexecutor.Request, opts coreexecutor.Options, skipPluginID string) (coreexecutor.Request, coreexecutor.Options) {

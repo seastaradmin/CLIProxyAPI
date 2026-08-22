@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -50,6 +52,19 @@ func (s *Service) Run(ctx context.Context) error {
 	}()
 
 	usage.StartDefault(ctx)
+	if s.cfg != nil {
+		usage.ConfigureDefaultAvailability(time.Duration(s.cfg.AvailabilityRetentionHours)*time.Hour, 0)
+	}
+	if path := s.availabilityStatePath(); path != "" {
+		usage.EnableDefaultAvailabilityPersistence(ctx, path)
+	}
+	if syncer, errSyncer := usage.NewSupabaseUsageSyncFromEnv(s.configPath); errSyncer != nil {
+		log.WithError(errSyncer).Warn("supabase usage sync disabled")
+	} else if syncer != nil {
+		s.supabaseUsageSync = syncer
+		syncer.Start(ctx)
+		log.Info("supabase usage sync enabled")
+	}
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)
@@ -116,6 +131,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
+	executorhelps.SetEndpointArchiveConfigPath(s.configPath)
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
 	s.syncPluginRuntimeConfig(ctx)
 	if homeEnabled {
@@ -345,9 +361,23 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		if s.supabaseUsageSync != nil {
+			s.supabaseUsageSync.Close()
+			s.supabaseUsageSync = nil
+		}
+		usage.ShutdownDefaultAvailabilityPersistence()
 		usage.StopDefault()
 	})
 	return shutdownErr
+}
+
+// availabilityStatePath returns the on-disk snapshot path for availability
+// metrics, stored next to the config file so metrics survive restarts.
+func (s *Service) availabilityStatePath() string {
+	if s == nil || s.configPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(s.configPath), "availability-state.json")
 }
 
 func (s *Service) ensureAuthDir() error {

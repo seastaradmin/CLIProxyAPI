@@ -570,6 +570,9 @@ func (m *Manager) AvailableProviders() []string {
 		if provider == "" {
 			continue
 		}
+		if m.channelDisabled(provider) {
+			continue
+		}
 		if _, ok := seen[provider]; ok {
 			continue
 		}
@@ -589,6 +592,9 @@ func (m *Manager) HasProviderAuth(provider string) bool {
 	}
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if provider == "" {
+		return false
+	}
+	if m.channelDisabled(provider) {
 		return false
 	}
 	m.mu.RLock()
@@ -952,8 +958,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	channelOff := m.channelDisabled(provider)
 	for _, candidate := range m.auths {
-		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
+		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled || channelOff {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -1205,17 +1212,20 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if candidate == nil || candidate.Disabled {
 			continue
 		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
-			continue
-		}
-		if disallowFreeAuth && isFreeCodexAuth(candidate) {
-			continue
-		}
 		providerKey := executorKeyFromAuth(candidate)
 		if providerKey == "" {
 			continue
 		}
 		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		if m.channelDisabled(providerKey) {
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		if disallowFreeAuth && isFreeCodexAuth(candidate) {
 			continue
 		}
 		if _, used := tried[candidate.ID]; used {

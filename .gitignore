@@ -22,6 +22,8 @@ objectstore/*
 
 # Static assets
 static/*
+!static/management.html
+static/*.bak-*
 
 # Authentication data
 auths/*
@@ -59,10 +61,21 @@ _bmad-output/*
 
 # Local artifacts and nested repositories
 cli-proxy-api.bak-*
+cli-proxy-api-*
+cli-proxy-api.before-release-*
 cliproxyapi
 /cpactl
 .codegraph/
 .omc/
 management-center/
 CPA-Manager-Plus/
-static/*.bak-*
+.scratch/
+.qoder/
+
+# Runtime state and deployment artifacts
+availability-state.json
+*.plist
+
+# Screenshots
+availability-page-*.png
+screenshot-*.png

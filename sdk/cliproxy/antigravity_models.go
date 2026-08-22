@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -20,21 +21,34 @@ const (
 )
 
 type antigravityFetchAvailableModelsResponse struct {
-	WebSearchModelIDs []string `json:"webSearchModelIds"`
+	Models            map[string]antigravityAvailableModel `json:"models"`
+	WebSearchModelIDs []string                             `json:"webSearchModelIds"`
+}
+
+type antigravityAvailableModel struct {
+	DisplayName         string `json:"displayName"`
+	MaxTokens           int    `json:"maxTokens"`
+	MaxCompletionTokens int    `json:"maxOutputTokens"`
 }
 
 type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 }
 
-func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Context, auth *coreauth.Auth) antigravityModelCapabilityHints {
+type antigravityFetchedModels struct {
+	Models            []*ModelInfo
+	CapabilityHints   antigravityModelCapabilityHints
+	AuthoritativeList bool
+}
+
+func (s *Service) fetchAntigravityModelsForAuth(ctx context.Context, auth *coreauth.Auth) antigravityFetchedModels {
 	if auth == nil || auth.Metadata == nil {
-		return antigravityModelCapabilityHints{}
+		return antigravityFetchedModels{}
 	}
 	accessToken, _ := auth.Metadata["access_token"].(string)
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {
-		return antigravityModelCapabilityHints{}
+		return antigravityFetchedModels{}
 	}
 
 	client := &http.Client{}
@@ -42,8 +56,9 @@ func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Contex
 		client.Transport = transport
 	}
 
+	payload := antigravityModelsRequestPayload(auth)
 	for _, baseURL := range antigravityModelBaseURLs(auth) {
-		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+antigravityModelsPath, strings.NewReader(`{}`))
+		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+antigravityModelsPath, strings.NewReader(string(payload)))
 		if errReq != nil {
 			continue
 		}
@@ -66,12 +81,30 @@ func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Contex
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			continue
 		}
-		hints := parseAntigravityModelCapabilityHints(body)
-		if len(hints.WebSearchModelIDs) > 0 {
-			return hints
+		fetched, ok := parseAntigravityFetchedModels(body)
+		if ok {
+			return fetched
 		}
 	}
-	return antigravityModelCapabilityHints{}
+	return antigravityFetchedModels{}
+}
+
+func antigravityModelsRequestPayload(auth *coreauth.Auth) []byte {
+	if auth == nil || auth.Metadata == nil {
+		return []byte(`{}`)
+	}
+	projectID, _ := auth.Metadata["project_id"].(string)
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return []byte(`{}`)
+	}
+	payload, errMarshal := json.Marshal(struct {
+		Project string `json:"project"`
+	}{Project: projectID})
+	if errMarshal != nil {
+		return []byte(`{}`)
+	}
+	return payload
 }
 
 func (s *Service) antigravityModelFetchProxyURL(auth *coreauth.Auth) string {
@@ -113,10 +146,13 @@ func resolveAntigravityModelBaseURL(auth *coreauth.Auth) string {
 	return ""
 }
 
-func parseAntigravityModelCapabilityHints(body []byte) antigravityModelCapabilityHints {
+func parseAntigravityFetchedModels(body []byte) (antigravityFetchedModels, bool) {
 	var parsed antigravityFetchAvailableModelsResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return antigravityModelCapabilityHints{}
+		return antigravityFetchedModels{}, false
+	}
+	if parsed.Models == nil {
+		return antigravityFetchedModels{}, false
 	}
 	webSearchModels := make(map[string]struct{}, len(parsed.WebSearchModelIDs))
 	for _, modelID := range parsed.WebSearchModelIDs {
@@ -125,11 +161,44 @@ func parseAntigravityModelCapabilityHints(body []byte) antigravityModelCapabilit
 			webSearchModels[modelID] = struct{}{}
 		}
 	}
-	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels}
+
+	modelIDs := make([]string, 0, len(parsed.Models))
+	for modelID := range parsed.Models {
+		modelID = strings.TrimSpace(modelID)
+		if modelID != "" {
+			modelIDs = append(modelIDs, modelID)
+		}
+	}
+	sort.Strings(modelIDs)
+	models := make([]*ModelInfo, 0, len(modelIDs))
+	for _, modelID := range modelIDs {
+		model := parsed.Models[modelID]
+		displayName := strings.TrimSpace(model.DisplayName)
+		if displayName == "" {
+			displayName = modelID
+		}
+		models = append(models, &ModelInfo{
+			ID:                  modelID,
+			Object:              "model",
+			OwnedBy:             "antigravity",
+			Type:                "antigravity",
+			DisplayName:         displayName,
+			Name:                modelID,
+			Description:         displayName,
+			ContextLength:       model.MaxTokens,
+			MaxCompletionTokens: model.MaxCompletionTokens,
+		})
+	}
+
+	return antigravityFetchedModels{
+		Models:            models,
+		CapabilityHints:   antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels},
+		AuthoritativeList: true,
+	}, true
 }
 
 func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
-	if len(models) == 0 || len(hints.WebSearchModelIDs) == 0 {
+	if len(models) == 0 {
 		return models
 	}
 
@@ -138,9 +207,7 @@ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigra
 			continue
 		}
 		modelID := normalizeAntigravityFetchedModelID(model.ID)
-		if _, ok := hints.WebSearchModelIDs[modelID]; ok {
-			model.SupportsWebSearch = true
-		}
+		_, model.SupportsWebSearch = hints.WebSearchModelIDs[modelID]
 	}
 	return models
 }

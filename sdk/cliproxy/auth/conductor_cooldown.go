@@ -75,6 +75,21 @@ func providerCoolingDisabledForAuth(auth *Auth, cfg *internalconfig.Config) bool
 	return entry != nil && entry.DisableCooling
 }
 
+// channelDisabled reports whether an entire OAuth/file-backed channel is disabled
+// via the oauth-disabled-channels config map. When true, all auth records whose
+// Provider matches the given key are excluded from routing.
+func (m *Manager) channelDisabled(provider string) bool {
+	if m == nil {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || cfg.OAuthDisabledChannels == nil {
+		return false
+	}
+	p := strings.ToLower(strings.TrimSpace(provider))
+	return cfg.OAuthDisabledChannels[p]
+}
+
 func nextTransientErrorRetryAfter(now time.Time) time.Time {
 	seconds := transientErrorCooldownSeconds.Load()
 	if seconds < 0 {
@@ -608,6 +623,7 @@ func cooldownStateRecordEqual(a, b CooldownStateRecord) bool {
 
 func cooldownQuotaEqual(a, b QuotaState) bool {
 	return a.Exceeded == b.Exceeded &&
+		a.Kind == b.Kind &&
 		a.Reason == b.Reason &&
 		a.BackoffLevel == b.BackoffLevel &&
 		a.NextRecoverAt.Equal(b.NextRecoverAt)
@@ -738,11 +754,28 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
-					if isModelSupportResultError(result.Error) {
+					if usageKind := usageErrorKind(result.Error); usageKind != "" {
+						state.StatusMessage = usageErrorStatusMessage(usageKind)
+						auth.StatusMessage = state.StatusMessage
+						quota, next := quotaStateAfterFailure(state.Quota, result.RetryAfter, now, disableCooling, usageKind)
+						state.NextRetryAfter = next
+						state.Quota = quota
+						if usageKind == UsageErrorKindQuotaExhausted && !disableCooling {
+							suspendReason = "quota"
+							shouldSuspendModel = true
+							setModelQuota = true
+						}
+					} else if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
+					} else if isModelUnavailableResultError(result.Error) {
+						// Transient model unavailability (e.g. "Model is unavailable") cools
+						// down briefly so the selector skips the model instead of hitting
+						// it again on every request.
+						state.NextRetryAfter = nextTransientErrorRetryAfter(now)
+						state.StatusMessage = "model unavailable"
 					} else if isCloudflareChallengeResultError(result.Error) {
 						next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
 						state.NextRetryAfter = next
@@ -761,8 +794,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							state.NextRetryAfter = time.Time{}
 						} else {
 							state.NextRetryAfter = now.Add(30 * time.Minute)
-							suspendReason = "invalid_grant"
-							shouldSuspendModel = true
 						}
 					} else {
 						switch statusCode {
@@ -770,50 +801,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "unauthorized"
-								shouldSuspendModel = true
+								state.NextRetryAfter = now.Add(30 * time.Minute)
 							}
 						case 402, 403:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "payment_required"
-								shouldSuspendModel = true
+								state.NextRetryAfter = now.Add(30 * time.Minute)
 							}
 						case 404:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(12 * time.Hour)
-								state.NextRetryAfter = next
-								suspendReason = "not_found"
-								shouldSuspendModel = true
-							}
-						case 429:
-							var next time.Time
-							backoffLevel := state.Quota.BackoffLevel
-							if !disableCooling {
-								if result.RetryAfter != nil {
-									next = now.Add(*result.RetryAfter)
-								} else {
-									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
-								}
-							}
-							state.NextRetryAfter = next
-							state.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "quota",
-								NextRecoverAt: next,
-								BackoffLevel:  backoffLevel,
-							}
-							if !disableCooling {
-								suspendReason = "quota"
-								shouldSuspendModel = true
-								setModelQuota = true
+								state.NextRetryAfter = now.Add(12 * time.Hour)
 							}
 						case 408, 500, 502, 503, 504:
 							if disableCooling {
@@ -969,6 +969,7 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	quotaExceeded := false
 	quotaRecover := time.Time{}
 	maxBackoffLevel := 0
+	quotaKind := UsageErrorKind("")
 	hasState := false
 	for _, state := range auth.ModelStates {
 		if state == nil {
@@ -996,6 +997,9 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		}
 		if state.Quota.Exceeded {
 			quotaExceeded = true
+			if state.Quota.Kind == string(UsageErrorKindQuotaExhausted) || quotaKind == "" {
+				quotaKind = UsageErrorKind(state.Quota.Kind)
+			}
 			if quotaRecover.IsZero() || (!state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.Before(quotaRecover)) {
 				quotaRecover = state.Quota.NextRecoverAt
 			}
@@ -1016,11 +1020,17 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	}
 	if quotaExceeded {
 		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
+		auth.Quota.Kind = string(quotaKind)
+		if quotaKind == UsageErrorKindRateLimited {
+			auth.Quota.Reason = "rate_limit"
+		} else {
+			auth.Quota.Reason = "quota"
+		}
 		auth.Quota.NextRecoverAt = quotaRecover
 		auth.Quota.BackoffLevel = maxBackoffLevel
 	} else {
 		auth.Quota.Exceeded = false
+		auth.Quota.Kind = ""
 		auth.Quota.Reason = ""
 		auth.Quota.NextRecoverAt = time.Time{}
 		auth.Quota.BackoffLevel = 0
@@ -1063,10 +1073,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.Unavailable = false
 	auth.Status = StatusActive
 	auth.StatusMessage = ""
-	auth.Quota.Exceeded = false
-	auth.Quota.Reason = ""
-	auth.Quota.NextRecoverAt = time.Time{}
-	auth.Quota.BackoffLevel = 0
+	auth.Quota = QuotaState{}
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
@@ -1193,6 +1200,28 @@ func statusCodeFromResult(err *Error) int {
 	return err.StatusCode()
 }
 
+func usageErrorKind(err *Error) UsageErrorKind {
+	if err == nil {
+		return ""
+	}
+	return ClassifyUsageError(statusCodeFromResult(err), err.Code, err.Message)
+}
+
+func usageErrorStatusMessage(kind UsageErrorKind) string {
+	switch kind {
+	case UsageErrorKindQuotaExhausted:
+		return "quota exhausted"
+	case UsageErrorKindRateLimited:
+		return "rate limited"
+	default:
+		return "cooldown"
+	}
+}
+
+func isQuotaResultError(err *Error) bool {
+	return usageErrorKind(err) == UsageErrorKindQuotaExhausted
+}
+
 func isModelSupportErrorMessage(message string) bool {
 	lower := strings.ToLower(strings.TrimSpace(message))
 	if lower == "" {
@@ -1202,13 +1231,35 @@ func isModelSupportErrorMessage(message string) bool {
 		"model_not_supported",
 		"requested model is not supported",
 		"requested model is unsupported",
-		"requested model is unavailable",
 		"model is not supported",
 		"model not supported",
 		"unsupported model",
-		"model unavailable",
 		"not available for your plan",
 		"not available for your account",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// isModelUnavailableErrorMessage matches transient upstream "model is
+// unavailable" responses (load shedding, temporary routing issues) that should
+// cool down briefly instead of being treated as permanent model support errors.
+func isModelUnavailableErrorMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"model is unavailable",
+		"model unavailable",
+		"requested model is unavailable",
+		"model not found",
+		"model_not_found",
+		"model not available",
 	}
 	for _, pattern := range patterns {
 		if strings.Contains(lower, pattern) {
@@ -1266,6 +1317,17 @@ func isModelSupportResultError(err *Error) bool {
 	return isModelSupportErrorMessage(err.Message)
 }
 
+func isModelUnavailableResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	return isModelUnavailableErrorMessage(err.Message)
+}
+
 func isCloudflareChallengeErrorMessage(message string) bool {
 	lower := strings.ToLower(strings.TrimSpace(message))
 	return strings.Contains(lower, "challenge-platform") ||
@@ -1311,6 +1373,24 @@ func isRequestScopedNotFoundMessage(message string) bool {
 	return strings.Contains(lower, "item with id") &&
 		strings.Contains(lower, "not found") &&
 		strings.Contains(lower, "items are not persisted when `store` is set to false")
+}
+
+// isRequestScopedStopError reports whether a failure is scoped to the request
+// itself and cannot be fixed by retrying or rotating credentials (request-scoped
+// interface errors and 404 item-miss responses). Ordinary 400 invalid-request
+// errors are NOT included: rotating to a more lenient provider may still
+// succeed, so they must keep flowing through credential rotation.
+func isRequestScopedStopError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isRequestScopedError(err) {
+		return true
+	}
+	if statusCodeFromError(err) == http.StatusNotFound {
+		return isRequestScopedNotFoundMessage(err.Error())
+	}
+	return false
 }
 
 func isRequestScopedNotFoundResultError(err *Error) bool {
@@ -1577,6 +1657,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	if usageKind := usageErrorKind(resultErr); usageKind != "" {
+		auth.StatusMessage = usageErrorStatusMessage(usageKind)
+		auth.Quota, auth.NextRetryAfter = quotaStateAfterFailure(auth.Quota, retryAfter, now, disableCooling, usageKind)
+		return
+	}
 	if isCloudflareChallengeResultError(resultErr) {
 		auth.StatusMessage = "cloudflare challenge"
 		next, backoffLevel := nextCloudflareCooldown(auth.Quota.BackoffLevel, disableCooling, now)
@@ -1620,20 +1705,6 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		} else {
 			auth.NextRetryAfter = now.Add(12 * time.Hour)
 		}
-	case 429:
-		auth.StatusMessage = "quota exhausted"
-		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
-		var next time.Time
-		if !disableCooling {
-			if retryAfter != nil {
-				next = now.Add(*retryAfter)
-			} else {
-				next, auth.Quota.BackoffLevel = quotaCooldownAfterFailure(auth.Quota, now)
-			}
-		}
-		auth.Quota.NextRecoverAt = next
-		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
 		if disableCooling {
@@ -1646,6 +1717,29 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+}
+
+func quotaStateAfterFailure(previous QuotaState, retryAfter *time.Duration, now time.Time, disableCooling bool, kind UsageErrorKind) (QuotaState, time.Time) {
+	var next time.Time
+	backoffLevel := previous.BackoffLevel
+	if !disableCooling {
+		if retryAfter != nil {
+			next = now.Add(*retryAfter)
+		} else {
+			next, backoffLevel = quotaCooldownAfterFailure(previous, now)
+		}
+	}
+	reason := "quota"
+	if kind == UsageErrorKindRateLimited {
+		reason = "rate_limit"
+	}
+	return QuotaState{
+		Exceeded:      true,
+		Kind:          string(kind),
+		Reason:        reason,
+		NextRecoverAt: next,
+		BackoffLevel:  backoffLevel,
+	}, next
 }
 
 // quotaCooldownAfterFailure returns the recovery deadline and backoff level for

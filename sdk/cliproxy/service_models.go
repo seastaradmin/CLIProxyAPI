@@ -7,6 +7,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
@@ -98,8 +99,13 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = registry.GetAIStudioModels()
 		models = applyExcludedModels(models, excluded)
 	case "antigravity":
-		models = registry.GetAntigravityModels()
-		models = applyAntigravityFetchedModelCapabilities(models, s.fetchAntigravityModelCapabilityHintsForAuth(ctx, a))
+		staticModels := registry.GetAntigravityModels()
+		fetched := s.fetchAntigravityModelsForAuth(ctx, a)
+		if fetched.AuthoritativeList {
+			models = applyAntigravityFetchedModelCapabilities(fetched.Models, fetched.CapabilityHints)
+		} else {
+			models = staticModels
+		}
 		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
@@ -199,7 +205,22 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 				if providerKey == "" {
 					providerKey = "openai-compatibility"
 				}
+				// Stamp per-model protocols for protocol-aware routing.
+				if compatEntry := s.findCompatEntry(compatName); compatEntry != nil {
+					apiKey := ""
+					if a.Attributes != nil {
+						apiKey = strings.TrimSpace(a.Attributes["api_key"])
+					}
+					stampModelProtocolsOnAuth(a, compatEntry, apiKey)
+				}
 				ms := cached.models
+				// When provider-level models are empty, try per-key models.
+				if len(ms) == 0 {
+					ms, _ = s.resolveOpenAICompatibilityModelsForAuth(a, compatName)
+				}
+				// Honor per-key/global excluded-models so disabled models are not
+				// registered (and thus never selected during failover).
+				ms = applyExcludedModels(ms, excluded)
 				if len(ms) > 0 {
 					ms = s.appendPluginModels(providerKey, ms)
 					s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
@@ -220,7 +241,19 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 				}
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
-					ms := buildOpenAICompatibilityConfigModels(compat)
+					// Stamp per-model protocols for protocol-aware routing.
+					apiKey := ""
+					if a.Attributes != nil {
+						apiKey = strings.TrimSpace(a.Attributes["api_key"])
+					}
+					stampModelProtocolsOnAuth(a, compat, apiKey)
+					ms, _ := s.resolveOpenAICompatibilityModelsForAuth(a, compatName)
+					if ms == nil {
+						ms = buildOpenAICompatibilityConfigModels(compat)
+					}
+					// Honor per-key/global excluded-models so disabled models are
+					// not registered (and thus never selected during failover).
+					ms = applyExcludedModels(ms, excluded)
 					// Register and return
 					if len(ms) > 0 {
 						if providerKey == "" {
@@ -666,6 +699,21 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 	}
 	now := time.Now().Unix()
 	models := make([]*ModelInfo, 0, len(compat.Models))
+	seen := make(map[string]struct{}, len(compat.Models))
+	appendRoute := func(info *ModelInfo) {
+		if info == nil {
+			return
+		}
+		key := strings.ToLower(strings.TrimSpace(info.ID))
+		if key == "" {
+			return
+		}
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		models = append(models, info)
+	}
 	for i := range compat.Models {
 		model := compat.Models[i]
 		modelType := "openai-compatibility"
@@ -683,9 +731,132 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		info.Thinking = thinking
 		info.SupportedInputModalities = normalizeCompatConfigModalities(model.InputModalities)
 		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)
-		models = append(models, info)
+		name := strings.TrimSpace(model.Name)
+		alias := strings.TrimSpace(model.Alias)
+		// Record the upstream name so downstream (aliasing, diagnostics) can
+		// recover it even when the route ID is the alias.
+		info.Name = name
+		appendRoute(info)
+		// Fork keeps the upstream name routable alongside the alias so both
+		// client-facing IDs resolve to this credential.
+		if model.Fork && alias != "" && name != "" && !strings.EqualFold(alias, name) {
+			forkInfo := *info
+			forkInfo.ID = name
+			forkInfo.DisplayName = name
+			appendRoute(&forkInfo)
+		}
 	}
 	return models
+}
+
+// resolveOpenAICompatibilityModelsForAuth returns the effective model list for one
+// openai-compat auth: per-key models when configured, otherwise the provider list.
+func (s *Service) resolveOpenAICompatibilityModelsForAuth(a *coreauth.Auth, compatName string) ([]*ModelInfo, bool) {
+	if s == nil || s.cfg == nil || a == nil {
+		return nil, false
+	}
+	compatName = strings.TrimSpace(compatName)
+	apiKey := ""
+	if a.Attributes != nil {
+		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+	}
+	for i := range s.cfg.OpenAICompatibility {
+		compat := &s.cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(compat.Name), compatName) {
+			continue
+		}
+		// Prefer matching API key entry with per-key models.
+		if apiKey != "" {
+			for j := range compat.APIKeyEntries {
+				entry := &compat.APIKeyEntries[j]
+				if strings.TrimSpace(entry.APIKey) != apiKey {
+					continue
+				}
+				if len(entry.Models) > 0 {
+					return buildOpenAICompatibilityModelsList(entry.Models, compat.Name), true
+				}
+				// Key found but no override → inherit provider models.
+				return buildOpenAICompatibilityConfigModels(compat), true
+			}
+		}
+		return buildOpenAICompatibilityConfigModels(compat), true
+	}
+	return nil, false
+}
+
+// buildOpenAICompatibilityModelsList builds ModelInfo from an explicit model slice.
+func buildOpenAICompatibilityModelsList(models []config.OpenAICompatibilityModel, ownedBy string) []*ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	tmp := &config.OpenAICompatibility{Name: ownedBy, Models: models}
+	return buildOpenAICompatibilityConfigModels(tmp)
+}
+
+// stampModelProtocolsOnAuth writes per-model protocol information into auth attributes
+// so the selector can perform protocol-aware filtering without reading config.
+// Attribute key format: "model_proto:{modelName}" -> "chat,responses,messages"
+
+// findCompatEntry returns the OpenAICompatibility config entry matching the given name.
+func (s *Service) findCompatEntry(compatName string) *config.OpenAICompatibility {
+	if s == nil || s.cfg == nil || compatName == "" {
+		return nil
+	}
+	for i := range s.cfg.OpenAICompatibility {
+		compat := &s.cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(compat.Name), compatName) {
+			return compat
+		}
+	}
+	return nil
+}
+
+func stampModelProtocolsOnAuth(a *coreauth.Auth, compat *config.OpenAICompatibility, apiKey string) {
+	if a == nil || compat == nil {
+		return
+	}
+	// Determine which model list applies to this auth.
+	var models []config.OpenAICompatibilityModel
+	if apiKey != "" {
+		for j := range compat.APIKeyEntries {
+			entry := &compat.APIKeyEntries[j]
+			if strings.TrimSpace(entry.APIKey) == apiKey && len(entry.Models) > 0 {
+				models = entry.Models
+				break
+			}
+		}
+	}
+	if len(models) == 0 {
+		models = compat.Models
+	}
+	if len(models) == 0 {
+		return
+	}
+	if a.Attributes == nil {
+		a.Attributes = make(map[string]string)
+	}
+	for i := range models {
+		m := &models[i]
+		name := strings.TrimSpace(m.Name)
+		if name == "" || len(m.Protocols) == 0 {
+			continue
+		}
+		normalized := util.NormalizeUpstreamProtocols(m.Protocols)
+		if len(normalized) == 0 {
+			continue
+		}
+		a.Attributes["model_proto:"+strings.ToLower(name)] = strings.Join(normalized, ",")
+		// Also stamp for alias if set.
+		if alias := strings.TrimSpace(m.Alias); alias != "" && !strings.EqualFold(alias, name) {
+			a.Attributes["model_proto:"+strings.ToLower(alias)] = strings.Join(normalized, ",")
+		}
+	}
 }
 
 func normalizeCompatConfigModalities(raw []string) []string {

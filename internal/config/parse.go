@@ -24,6 +24,8 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
+	cfg.AvailabilityRetentionHours = 24
+	cfg.RequestJournalKeepDays = 30
 	cfg.DisableCooling = false
 	cfg.SaveCooldownStatus = false
 	cfg.TransientErrorCooldownSeconds = 0
@@ -77,6 +79,20 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.RedisUsageQueueRetentionSeconds = 3600
 	}
 
+	if cfg.AvailabilityRetentionHours <= 0 {
+		cfg.AvailabilityRetentionHours = 24
+	} else if cfg.AvailabilityRetentionHours > 720 {
+		log.WithField("value", cfg.AvailabilityRetentionHours).Warn("availability-retention-hours too large; clamping to 720")
+		cfg.AvailabilityRetentionHours = 720
+	}
+
+	if cfg.RequestJournalKeepDays <= 0 {
+		cfg.RequestJournalKeepDays = 30
+	} else if cfg.RequestJournalKeepDays > 3650 {
+		log.WithField("value", cfg.RequestJournalKeepDays).Warn("request-journal-keep-days too large; clamping to 3650")
+		cfg.RequestJournalKeepDays = 3650
+	}
+
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
@@ -97,6 +113,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SanitizeClaudeKeys()
 	cfg.SanitizeOpenAICompatibility()
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
+	cfg.OAuthDisabledChannels = NormalizeOAuthDisabledChannels(cfg.OAuthDisabledChannels)
 	cfg.SanitizeOAuthModelAlias()
 	cfg.SanitizePayloadRules()
 

@@ -138,7 +138,6 @@ type queuedUsageDetail struct {
 	RequestID           string                   `json:"request_id"`
 	ReasoningEffort     string                   `json:"reasoning_effort"`
 	ServiceTier         string                   `json:"service_tier"`
-	RequestServiceTier  string                   `json:"request_service_tier"`
 	ResponseServiceTier string                   `json:"response_service_tier,omitempty"`
 }
 

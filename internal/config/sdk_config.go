@@ -76,4 +76,10 @@ type StreamingConfig struct {
 	// When exceeded before any client-visible payload is produced, the attempt fails as retryable so
 	// auth rotation / bootstrap retries can switch sources instead of hanging for minutes.
 	FirstChunkTimeoutSeconds int `yaml:"first-chunk-timeout-seconds,omitempty" json:"first-chunk-timeout-seconds,omitempty"`
+
+	// StallTimeoutSeconds is how long a stream may stay completely silent (no
+	// bytes at all) after it has started before the executor declares it a dead
+	// stream and fails it as retryable. 0 means default 30s; negative disables
+	// the stall guard.
+	StallTimeoutSeconds int `yaml:"stall-timeout-seconds,omitempty" json:"stall-timeout-seconds,omitempty"`
 }

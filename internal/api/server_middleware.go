@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/controlplane"
 	"net/http"
 	"strings"
 
@@ -146,6 +147,18 @@ func corsMiddleware() gin.HandlerFunc {
 func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if manager == nil {
+			c.Next()
+			return
+		}
+
+		// Control-plane integration: keys already validated against the shared
+		// Redis auth cache (snapshot injected into the request context) bypass
+		// the static access providers. Their attribution travels with the
+		// snapshot for usage reporting.
+		if snap := controlplane.KeySnapshot(c.Request.Context()); snap != nil {
+			c.Set("userApiKey", snap.KeyID)
+			c.Set("accessProvider", "controlplane")
+			c.Set("controlplaneSnapshot", snap)
 			c.Next()
 			return
 		}

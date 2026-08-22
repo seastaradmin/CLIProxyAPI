@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -271,22 +272,18 @@ func openAICompatEndpoint(to sdktranslator.Format, alt string) string {
 }
 
 // openAICompatEndpointResolved returns the endpoint path for the given protocol,
-// preferring a stored protocol-endpoint from config (populated by protocol-probe-batch).
-// Falls back to the standard openAICompatEndpoint logic when no stored path exists.
+// preferring a runtime-proven override, then a stored protocol-endpoint from
+// config (populated by protocol-probe-batch or runtime discovery).
+// Falls back to the standard openAICompatEndpoint logic when neither exists.
 func (e *OpenAICompatExecutor) openAICompatEndpointResolved(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, to sdktranslator.Format, alt string) string {
 	if alt == "responses/compact" {
 		return "/responses/compact"
 	}
 	protoLabel := protocolLabelFromFormat(to)
-	if protoLabel == "chat" {
-		return "/chat/completions"
-	}
-	// Check config for stored endpoint path.
-	if e != nil && e.cfg != nil && auth != nil {
-		modelName := thinking.ParseSuffix(req.Model).ModelName
-		compatName := ""
-		baseURL := ""
-		authAPIKey := ""
+	compatName := ""
+	baseURL := ""
+	authAPIKey := ""
+	if auth != nil {
 		if auth.Attributes != nil {
 			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
 			baseURL = strings.TrimRight(strings.TrimSpace(auth.Attributes["base_url"]), "/")
@@ -295,11 +292,23 @@ func (e *OpenAICompatExecutor) openAICompatEndpointResolved(auth *cliproxyauth.A
 		if compatName == "" {
 			compatName = strings.TrimSpace(auth.Label)
 		}
+	}
+	// A runtime-proven endpoint wins over stored config: the stored path may be
+	// the one that just failed with 404.
+	if ep := helps.LookupEndpointOverride(compatName, baseURL, protoLabel); ep != "" {
+		return ep
+	}
+	// Check config for stored endpoint path.
+	if e != nil && e.cfg != nil && auth != nil {
+		modelName := thinking.ParseSuffix(req.Model).ModelName
 		matchStoredEndpoint := func(list []config.OpenAICompatibilityModel) string {
 			for j := range list {
 				m := &list[j]
+				alias := strings.TrimSpace(m.Alias)
 				actual := strings.TrimSpace(m.Name)
-				if actual != "" && strings.EqualFold(actual, modelName) {
+				matched := (actual != "" && (strings.EqualFold(actual, modelName) || strings.EqualFold(actual, req.Model))) ||
+					(alias != "" && (strings.EqualFold(alias, modelName) || strings.EqualFold(alias, req.Model)))
+				if matched {
 					if ep, ok := m.ProtocolEndpoints[protoLabel]; ok && ep != "" {
 						return ep
 					}
@@ -348,6 +357,27 @@ func (e *OpenAICompatExecutor) openAICompatEndpointResolved(auth *cliproxyauth.A
 	return openAICompatEndpoint(to, alt)
 }
 
+// rememberWorkingEndpoint records a runtime-proven endpoint suffix in memory
+// and archives it to config.yaml asynchronously.
+func (e *OpenAICompatExecutor) rememberWorkingEndpoint(auth *cliproxyauth.Auth, protoLabel, suffix string) {
+	compatName := ""
+	baseURL := ""
+	if auth != nil {
+		if auth.Attributes != nil {
+			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
+			baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+		}
+		if compatName == "" {
+			compatName = strings.TrimSpace(auth.Label)
+		}
+	}
+	if compatName == "" {
+		return
+	}
+	helps.StoreEndpointOverride(compatName, baseURL, protoLabel, suffix)
+	helps.ArchiveProtocolEndpointAsync(compatName, protoLabel, suffix)
+}
+
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImages(ctx, auth, req, opts, endpointPath)
@@ -385,6 +415,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = sanitizeOpenAICompatTools(e.provider, auth, to, translated)
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -393,43 +424,65 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
-	url := strings.TrimSuffix(baseURL, "/") + endpoint
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
-	if err != nil {
-		return resp, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	applyOpenAICompatAuthHeaders(httpReq, apiKey, to)
-	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
-	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      translated,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	sendOnce := func(endpointPath string) (*http.Response, error) {
+		urlOnce := strings.TrimSuffix(baseURL, "/") + endpointPath
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, urlOnce, bytes.NewReader(translated))
+		if errReq != nil {
+			return nil, errReq
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		applyOpenAICompatAuthHeaders(httpReq, apiKey, to)
+		httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+		util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       urlOnce,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      translated,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		return httpClient.Do(httpReq)
+	}
+	httpResp, err := sendOnce(endpoint)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
+	}
+	// Self-heal /v1 path mismatches: on 404 retry the alternate suffix once; a
+	// success is remembered and archived (the /v1-ness of a base URL is stable).
+	if httpResp.StatusCode == http.StatusNotFound {
+		if altEndpoint := helps.ToggleV1EndpointSuffix(endpoint); altEndpoint != "" {
+			altResp, altErr := sendOnce(altEndpoint)
+			if altErr == nil && altResp.StatusCode >= 200 && altResp.StatusCode < 300 {
+				helps.LogWithRequestID(ctx).Infof("openai compat executor: endpoint %s returned 404, alternate %s succeeded", endpoint, altEndpoint)
+				e.rememberWorkingEndpoint(auth, protocolLabelFromFormat(to), altEndpoint)
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("openai compat executor: close response body error: %v", errClose)
+				}
+				httpResp = altResp
+			} else if altErr == nil {
+				_, _ = io.Copy(io.Discard, altResp.Body)
+				if errClose := altResp.Body.Close(); errClose != nil {
+					log.Errorf("openai compat executor: close response body error: %v", errClose)
+				}
+			}
+		}
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -586,53 +639,105 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = sanitizeOpenAICompatTools(e.provider, auth, to, translated)
 
-	// stream_options is OpenAI chat/responses only; Anthropic messages rejects unknown fields
-	// on some gateways and must not be injected during messages passthrough.
-	if to.String() == "openai" || to.String() == "openai-response" {
+	// stream_options is chat-completions only; responses API has built-in usage reporting,
+	// and Anthropic messages rejects unknown fields.
+	if to.String() == "openai" {
 		translated = helps.SetBoolIfDifferent(translated, "stream_options.include_usage", true)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
-	url := strings.TrimSuffix(baseURL, "/") + endpoint
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	applyOpenAICompatAuthHeaders(httpReq, apiKey, to)
-	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
-	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      translated,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	sendOnce := func(endpointPath string, requestBody []byte) (*http.Response, error) {
+		urlOnce := strings.TrimSuffix(baseURL, "/") + endpointPath
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, urlOnce, bytes.NewReader(requestBody))
+		if errReq != nil {
+			return nil, errReq
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		applyOpenAICompatAuthHeaders(httpReq, apiKey, to)
+		httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+		util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Cache-Control", "no-cache")
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       urlOnce,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      requestBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		return httpClient.Do(httpReq)
+	}
+	httpResp, err := sendOnce(endpoint, translated)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
+	}
+	// Self-heal /v1 path mismatches: on 404 retry the alternate suffix once; a
+	// success is remembered and archived (the /v1-ness of a base URL is stable).
+	if httpResp.StatusCode == http.StatusNotFound {
+		if altEndpoint := helps.ToggleV1EndpointSuffix(endpoint); altEndpoint != "" {
+			altResp, altErr := sendOnce(altEndpoint, translated)
+			if altErr == nil && altResp.StatusCode >= 200 && altResp.StatusCode < 300 {
+				helps.LogWithRequestID(ctx).Infof("openai compat executor: endpoint %s returned 404, alternate %s succeeded", endpoint, altEndpoint)
+				e.rememberWorkingEndpoint(auth, protocolLabelFromFormat(to), altEndpoint)
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("openai compat executor: close response body error: %v", errClose)
+				}
+				httpResp = altResp
+			} else if altErr == nil {
+				_, _ = io.Copy(io.Discard, altResp.Body)
+				if errClose := altResp.Body.Close(); errClose != nil {
+					log.Errorf("openai compat executor: close response body error: %v", errClose)
+				}
+			}
+		}
+	}
+	// Self-heal Claude adaptive thinking rejection: some Anthropic-compatible
+	// middleboxes only accept thinking.type in {enabled, disabled, auto} and
+	// reject the Claude 4.6 adaptive form with a 400. Retry once with the
+	// thinking downgraded to the legacy enabled/auto form.
+	if httpResp.StatusCode == http.StatusBadRequest && thinking.HasClaudeAdaptiveThinking(translated) {
+		b, _ := io.ReadAll(httpResp.Body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("openai compat executor: close response body error: %v", errClose)
+		}
+		if isClaudeThinkingTypeRejected(b) {
+			downgraded := thinking.DowngradeClaudeAdaptiveThinking(translated)
+			if !bytes.Equal(downgraded, translated) {
+				helps.LogWithRequestID(ctx).Infof("openai compat executor: upstream rejected adaptive thinking, retrying with legacy thinking")
+				if altResp, altErr := sendOnce(endpoint, downgraded); altErr == nil {
+					httpResp = altResp
+				} else {
+					helps.RecordAPIResponseError(ctx, e.cfg, altErr)
+					err = statusErr{code: http.StatusBadRequest, msg: string(b)}
+					return nil, err
+				}
+			} else {
+				err = statusErr{code: http.StatusBadRequest, msg: string(b)}
+				return nil, err
+			}
+		} else {
+			err = statusErr{code: http.StatusBadRequest, msg: string(b)}
+			return nil, err
+		}
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -646,7 +751,16 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	stallTimeout := helps.ResolveStallTimeout(e.cfg.Streaming.StallTimeoutSeconds)
+	stallWatchdog := helps.NewStallWatchdog(ctx, stallTimeout, func() {
+		// Close the response body to unblock the scanner so the dead stream is
+		// failed as retryable instead of hanging forever.
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("openai compat executor: close stalled response body error: %v", errClose)
+		}
+	})
 	go func() {
+		defer stallWatchdog.Stop()
 		defer close(out)
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
@@ -662,10 +776,23 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		// Anthropic messages SSE includes event:/id: lines that the OpenAI data:-only scanner drops.
 		// Only enable raw passthrough for true claude→claude; openai→openai still needs error detection.
 		passthroughStream := from.String() == "claude" && to.String() == "claude"
+		// Tracks whether the upstream stream reached its protocol-level terminal
+		// marker. Clients often drop the connection right after receiving the
+		// final event, which can cancel the context before the upstream EOF is
+		// observed; that must not be recorded as a failure.
+		sawStreamTerminal := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			if helps.IsStreamEventLine(line) {
+				stallWatchdog.Progress()
+			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if passthroughStream {
+				// Sniff usage from passthrough stream for TPS/availability metrics.
+				streamUsage.ObserveOpenAIStream(line)
+				if !sawStreamTerminal && bytes.Contains(line, []byte(`"type":"message_stop"`)) {
+					sawStreamTerminal = true
+				}
 				// Preserve original framing (line + newline).
 				payload := append(append([]byte(nil), line...), '\n')
 				select {
@@ -699,6 +826,17 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				continue
 			}
 
+			// Track protocol-level terminal markers: chat "[DONE]", responses
+			// "response.completed", and Anthropic "message_stop".
+			if !sawStreamTerminal {
+				payloadPart := bytes.TrimSpace(trimmedLine[len("data:"):])
+				if bytes.Equal(payloadPart, []byte("[DONE]")) ||
+					bytes.Contains(payloadPart, []byte(`"type":"response.completed"`)) ||
+					bytes.Contains(payloadPart, []byte(`"type":"message_stop"`)) {
+					sawStreamTerminal = true
+				}
+			}
+
 			// Cross-protocol streams use registered translators (e.g. openai→claude).
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param, claudeInputTokens)
 			for i := range chunks {
@@ -710,11 +848,23 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
+			if stallWatchdog.Stalled() {
+				// Dead stream: the upstream stopped sending event lines entirely.
+				// Report it as a retryable timeout so the handler maps it to 529 and
+				// the client SDK retries instead of parsing a truncated stream.
+				errScan = fmt.Errorf("upstream stream stalled (no data for %v): %w", stallTimeout, context.DeadlineExceeded)
+			}
+			if sawStreamTerminal && errors.Is(errScan, context.Canceled) {
+				// The client dropped the connection after the stream already
+				// reached its terminal marker; the response was fully delivered,
+				// so fall through and publish the collected usage as a success.
+			} else {
+				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+				reporter.PublishFailure(ctx, errScan)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+				case <-ctx.Done():
+				}
 			}
 		} else if !passthroughStream {
 			// In case the upstream close the stream without a terminal [DONE] marker.
@@ -1073,3 +1223,15 @@ func (e statusErr) Error() string {
 }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+
+// isClaudeThinkingTypeRejected detects upstream 400 responses that reject the
+// Claude adaptive thinking form because thinking.type must be one of
+// enabled/disabled/auto (common on Anthropic-compatible middleboxes).
+func isClaudeThinkingTypeRejected(body []byte) bool {
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "must be in") &&
+		strings.Contains(text, "enabled") &&
+		strings.Contains(text, "disabled") &&
+		strings.Contains(text, "auto") &&
+		strings.Contains(text, "type")
+}

@@ -285,6 +285,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 	if changed {
 		syncAuthFileMetadataFields(targetAuth, touchedRoots)
+		if _, ok := touchedRoots["excluded_models"]; ok {
+			syncAuthFileExcludedModels(targetAuth, h.cfg)
+		}
+		if _, ok := touchedRoots["excluded-models"]; ok {
+			syncAuthFileExcludedModels(targetAuth, h.cfg)
+		}
 	}
 
 	if !changed {

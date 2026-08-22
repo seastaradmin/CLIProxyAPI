@@ -335,6 +335,9 @@ func classifyHealthError(ctx context.Context, statusCode int, message string) st
 		return "timeout"
 	}
 	lower := strings.ToLower(message)
+	if coreauth.IsQuotaLikeError(statusCode, "", message) {
+		return "rate_limit"
+	}
 	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden ||
 		strings.Contains(lower, "invalid_grant") || strings.Contains(lower, "refresh token") ||
 		strings.Contains(lower, "unauthorized") || strings.Contains(lower, "forbidden") ||

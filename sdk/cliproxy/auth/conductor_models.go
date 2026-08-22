@@ -147,7 +147,7 @@ func (m *Manager) resolveOpenAICompatUpstreamModelPool(auth *Auth, requestedMode
 	if entry == nil {
 		return nil
 	}
-	return resolveModelAliasPoolFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+	return resolveModelAliasPoolFromConfigModels(requestedModel, asModelAliasEntries(openAICompatAliasModels(entry, auth)))
 }
 
 func preserveRequestedModelSuffix(requestedModel, resolved string) string {
@@ -379,7 +379,7 @@ func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel s
 		}
 		if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
 			if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
-				models = asModelAliasEntries(entry.Models)
+				models = asModelAliasEntries(openAICompatAliasModels(entry, auth))
 			}
 		}
 	}
@@ -506,7 +506,7 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 			}
 			if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
 				if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
-					compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+					compileAPIKeyModelAliasForModels(byAlias, openAICompatAliasModels(entry, auth))
 				}
 			}
 		}
@@ -781,7 +781,39 @@ func resolveUpstreamModelForOpenAICompatAPIKey(cfg *internalconfig.Config, auth 
 	if entry == nil {
 		return ""
 	}
-	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(openAICompatAliasModels(entry, auth)))
+}
+
+// openAICompatAliasModels returns the effective model list used for alias
+// resolution of one openai-compat auth: the key entry owning this auth first,
+// then the provider-level list, then any other key entry list. This mirrors
+// the precedence used by the executor's protocol/endpoint matching so that
+// per-key model aliases are rewritten to their upstream names.
+func openAICompatAliasModels(entry *internalconfig.OpenAICompatibility, auth *Auth) []internalconfig.OpenAICompatibilityModel {
+	if entry == nil {
+		return nil
+	}
+	authAPIKey := ""
+	if auth != nil && auth.Attributes != nil {
+		authAPIKey = strings.TrimSpace(auth.Attributes["api_key"])
+	}
+	out := make([]internalconfig.OpenAICompatibilityModel, 0, len(entry.Models))
+	if authAPIKey != "" {
+		for i := range entry.APIKeyEntries {
+			if strings.TrimSpace(entry.APIKeyEntries[i].APIKey) == authAPIKey {
+				out = append(out, entry.APIKeyEntries[i].Models...)
+				break
+			}
+		}
+	}
+	out = append(out, entry.Models...)
+	for i := range entry.APIKeyEntries {
+		if authAPIKey != "" && strings.TrimSpace(entry.APIKeyEntries[i].APIKey) == authAPIKey {
+			continue
+		}
+		out = append(out, entry.APIKeyEntries[i].Models...)
+	}
+	return out
 }
 
 type apiKeyModelAliasTable map[string]map[string]string

@@ -10,6 +10,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
 
@@ -201,6 +202,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	setGenerateMetadata(reqMeta, rawJSON)
+	setImageFingerprintMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -330,6 +332,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 
 	var bootstrapPayload []byte
+	var bootstrapPrefixPayloads [][]byte
 	bootstrapChunkIndex := 0
 	var bootstrapHistoryChunks [][]byte
 	var bootstrapStreamErr error
@@ -349,6 +352,13 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				chunk, ok = <-chunks
 			}
 			if !ok {
+				if len(bootstrapPrefixPayloads) > 0 {
+					// The stream ended after protocol metadata but before producing any
+					// content; report a retryable bootstrap failure instead of committing
+					// an empty response to the client.
+					bootstrapStreamErr = fmt.Errorf("upstream stream closed before producing content")
+					return
+				}
 				streamClosedBeforeRead = true
 				applyStreamHeaderInit()
 				return
@@ -366,6 +376,13 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				return
 			}
 			if !deliverable {
+				continue
+			}
+			if !isStreamContentPayload(responseProtocol, payload) {
+				// Buffer protocol-metadata payloads (message_start, role deltas, ...)
+				// so a stream that dies before producing content can be retried
+				// without exposing anything the client has already seen.
+				bootstrapPrefixPayloads = append(bootstrapPrefixPayloads, payload)
 				continue
 			}
 			bootstrapPayload = payload
@@ -416,6 +433,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		streamClosedBeforeRead = false
 		bootstrapStreamErr = nil
 		bootstrapPayload = nil
+		bootstrapPrefixPayloads = nil
 		bootstrapChunkIndex = 0
 		bootstrapHistoryChunks = nil
 		chunks = retryResult.Chunks
@@ -474,6 +492,14 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		chunkIndex := bootstrapChunkIndex
 		historyChunks := bootstrapHistoryChunks
 		if bootstrapPayload != nil {
+			for _, prefixPayload := range bootstrapPrefixPayloads {
+				if okSendData := sendData(prefixPayload); !okSendData {
+					return
+				}
+				if streamInterceptorsActive {
+					historyChunks = appendStreamInterceptorHistory(historyChunks, prefixPayload)
+				}
+			}
 			if okSendData := sendData(bootstrapPayload); !okSendData {
 				return
 			}
@@ -537,6 +563,70 @@ func validateSSEDataJSON(chunk []byte) error {
 			preview = preview[:max]
 		}
 		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
+	}
+	return nil
+}
+
+// isStreamContentPayload reports whether a stream payload carries client-visible
+// model output for the given response protocol. Protocol-metadata payloads
+// (Anthropic message_start, OpenAI role/usage deltas, etc.) are buffered during
+// bootstrap so a stream that dies before producing content can be retried
+// without exposing anything the client has already seen. Unknown protocols fall
+// back to treating the first payload as content (legacy behavior).
+func isStreamContentPayload(protocol string, payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	switch protocol {
+	case "claude", "openai", "openai-response", "gemini":
+		data := sseDataPayload(payload)
+		if data == nil {
+			// No parseable JSON data line (raw passthrough, [DONE], split SSE
+			// frames); treat the payload as content so the retry window is never
+			// widened on unclassifiable data.
+			return true
+		}
+		payload = data
+	}
+	switch protocol {
+	case "claude":
+		switch gjson.GetBytes(payload, "type").String() {
+		case "content_block_delta", "message_stop":
+			// Content deltas and the protocol terminal marker both commit the
+			// stream; a completed (even empty) upstream response must not be
+			// re-executed.
+			return true
+		}
+		return false
+	case "openai":
+		return gjson.GetBytes(payload, "choices.0.delta.content").String() != "" ||
+			gjson.GetBytes(payload, "choices.0.delta.reasoning_content").String() != ""
+	case "openai-response":
+		switch gjson.GetBytes(payload, "type").String() {
+		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.completed", "response.done":
+			return true
+		}
+		return false
+	case "gemini":
+		return gjson.GetBytes(payload, "candidates.0.content.parts.0.text").String() != ""
+	default:
+		return true
+	}
+}
+
+// sseDataPayload extracts the JSON payload of the first SSE data line from a
+// chunk that may carry event:/id:/data: lines (a complete event frame or raw
+// upstream lines). Returns nil when the chunk carries no parseable JSON data.
+func sseDataPayload(chunk []byte) []byte {
+	for _, rawLine := range bytes.Split(chunk, []byte("\n")) {
+		line := bytes.TrimSpace(rawLine)
+		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[len("data:"):])
+		if len(data) > 0 && gjson.ValidBytes(data) {
+			return data
+		}
 	}
 	return nil
 }

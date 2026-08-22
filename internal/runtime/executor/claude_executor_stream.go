@@ -168,7 +168,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	stallTimeout := helps.ResolveStallTimeout(e.cfg.Streaming.StallTimeoutSeconds)
+	stallWatchdog := helps.NewStallWatchdog(ctx, stallTimeout, func() {
+		// Close the response body to unblock the scanner so a dead stream is
+		// failed as retryable instead of hanging forever.
+		if errClose := decodedBody.Close(); errClose != nil {
+			log.Errorf("claude executor: close stalled response body error: %v", errClose)
+		}
+	})
 	go func() {
+		defer stallWatchdog.Stop()
 		defer close(out)
 		defer func() {
 			if errClose := decodedBody.Close(); errClose != nil {
@@ -196,6 +205,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			for scanner.Scan() {
 				line := scanner.Bytes()
+				if helps.IsStreamEventLine(line) {
+					stallWatchdog.Progress()
+				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
@@ -212,6 +224,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				return
 			}
 			if errScan := scanner.Err(); errScan != nil {
+				if stallWatchdog.Stalled() {
+					// Dead stream: report a retryable timeout instead of a truncated
+					// stream so the client SDK retries (mapped to 529 by the handler).
+					errScan = fmt.Errorf("upstream stream stalled (no data for %v): %w", stallTimeout, context.DeadlineExceeded)
+				}
 				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 				reporter.PublishFailure(ctx, errScan)
 				select {
@@ -228,6 +245,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			if helps.IsStreamEventLine(line) {
+				stallWatchdog.Progress()
+			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
@@ -253,6 +273,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			if stallWatchdog.Stalled() {
+				errScan = fmt.Errorf("upstream stream stalled (no data for %v): %w", stallTimeout, context.DeadlineExceeded)
+			}
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {

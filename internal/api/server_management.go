@@ -162,6 +162,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
+		mgmt.PATCH("/auth-files/quota-status", s.mgmt.PatchAuthFileQuotaStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
@@ -172,6 +173,26 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/xai-auth-url", s.mgmt.RequestXAIToken)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 		mgmt.DELETE("/oauth-session", s.mgmt.CancelAuthSession)
+
+		// Availability monitoring and request journal
+		mgmt.GET("/availability", s.mgmt.GetAvailability)
+		mgmt.GET("/user-side-availability", s.mgmt.GetUserSideAvailability)
+		mgmt.GET("/user-side-availability/requests", s.mgmt.GetUserSideRequestChains)
+		mgmt.GET("/user-side-availability/trend", s.mgmt.GetUserSideAvailabilityTrend)
+		mgmt.GET("/request-journal", s.mgmt.GetRequestJournal)
+		mgmt.DELETE("/request-journal", s.mgmt.DeleteRequestJournal)
+		mgmt.DELETE("/request-journal/:id", s.mgmt.DeleteRequestJournalRecord)
+
+		// Auth file health check and model probe
+		mgmt.POST("/auth-files/health-check", s.mgmt.HealthCheckAuthFile)
+		mgmt.POST("/auth-files/health-check-batch", s.mgmt.HealthCheckAuthFilesBatch)
+		mgmt.GET("/auth-files/model-probe-results", s.mgmt.ListModelProbeResults)
+		mgmt.POST("/protocol-probe", s.mgmt.ProbeUpstreamProtocols)
+		mgmt.POST("/protocol-probe-batch", s.mgmt.ProtocolProbeBatch)
+
+		// Usage and diagnostics
+		mgmt.GET("/usage-recent", s.mgmt.GetUsageRecent)
+		mgmt.GET("/config-diagnostics", s.mgmt.ConfigDiagnostics)
 	}
 }
 

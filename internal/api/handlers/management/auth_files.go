@@ -291,6 +291,123 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	return h.buildAuthFileEntryLocked(auth)
 }
 
+type authCooldownSummary struct {
+	inCooldown bool
+	until      time.Time
+	kind       string
+	reason     string
+	models     []gin.H
+}
+
+func authCooldownKind(quota coreauth.QuotaState, statusMessage string, lastErr *coreauth.Error) string {
+	if kind := strings.TrimSpace(quota.Kind); kind != "" {
+		switch strings.ToLower(kind) {
+		case "quota":
+			return string(coreauth.UsageErrorKindQuotaExhausted)
+		case "rate_limit", "rate-limited":
+			return string(coreauth.UsageErrorKindRateLimited)
+		}
+		return kind
+	}
+	if kind := coreauth.ClassifyUsageError(lastErrorStatusCode(lastErr), lastErrorCode(lastErr), lastErrorMessage(lastErr)); kind != "" {
+		return string(kind)
+	}
+	if strings.EqualFold(strings.TrimSpace(quota.Reason), "rate_limit") || strings.Contains(strings.ToLower(statusMessage), "rate limit") {
+		return string(coreauth.UsageErrorKindRateLimited)
+	}
+	if strings.EqualFold(strings.TrimSpace(quota.Reason), "quota") || strings.Contains(strings.ToLower(statusMessage), "quota") {
+		return string(coreauth.UsageErrorKindQuotaExhausted)
+	}
+	return "cooldown"
+}
+
+func lastErrorStatusCode(err *coreauth.Error) int {
+	if err == nil {
+		return 0
+	}
+	return err.StatusCode()
+}
+
+func lastErrorCode(err *coreauth.Error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Code
+}
+
+func lastErrorMessage(err *coreauth.Error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Message
+}
+
+func cooldownDisplayReason(kind, statusMessage string, quota coreauth.QuotaState) string {
+	switch kind {
+	case string(coreauth.UsageErrorKindQuotaExhausted):
+		return "quota exhausted"
+	case string(coreauth.UsageErrorKindRateLimited):
+		return "rate limited"
+	}
+	if message := strings.TrimSpace(statusMessage); message != "" {
+		return message
+	}
+	return strings.TrimSpace(quota.Reason)
+}
+
+func addAuthCooldownDetail(summary *authCooldownSummary, now time.Time, model string, unavailable bool, next time.Time, quota coreauth.QuotaState, statusMessage string, lastErr *coreauth.Error) {
+	if summary == nil || !unavailable || next.IsZero() {
+		return
+	}
+	if quota.NextRecoverAt.After(next) {
+		next = quota.NextRecoverAt
+	}
+	if !next.After(now) {
+		return
+	}
+	kind := authCooldownKind(quota, statusMessage, lastErr)
+	reason := cooldownDisplayReason(kind, statusMessage, quota)
+	if summary.until.IsZero() || next.Before(summary.until) {
+		summary.until = next
+		summary.kind = kind
+		summary.reason = reason
+	}
+	summary.inCooldown = true
+	if model == "" {
+		return
+	}
+	summary.models = append(summary.models, gin.H{
+		"model":          model,
+		"kind":           kind,
+		"reason":         reason,
+		"status":         "cooling",
+		"cooldown_until": next,
+	})
+}
+
+func authCooldownSummaryFor(auth *coreauth.Auth, now time.Time) authCooldownSummary {
+	var summary authCooldownSummary
+	if auth == nil {
+		return summary
+	}
+	if auth.Unavailable {
+		addAuthCooldownDetail(&summary, now, "", true, auth.NextRetryAfter, auth.Quota, auth.StatusMessage, auth.LastError)
+	}
+	models := make([]string, 0, len(auth.ModelStates))
+	for model := range auth.ModelStates {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		state := auth.ModelStates[model]
+		if state == nil {
+			continue
+		}
+		addAuthCooldownDetail(&summary, now, model, state.Unavailable, state.NextRetryAfter, state.Quota, state.StatusMessage, state.LastError)
+	}
+	return summary
+}
+
 func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if auth == nil {
 		return nil
@@ -308,6 +425,8 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	now := time.Now()
+	cooldown := authCooldownSummaryFor(auth, now)
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
@@ -319,13 +438,42 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		"status_message": auth.StatusMessage,
 		"disabled":       auth.Disabled,
 		"unavailable":    auth.Unavailable,
+		"problem_kind":   "none",
+		"in_cooldown":    cooldown.inCooldown,
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
 		"size":           int64(0),
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
-	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	entry["recent_requests"] = auth.RecentRequestsSnapshot(now)
+	if auth.Quota.Exceeded {
+		entry["quota"] = auth.Quota
+	}
+	entry["cooling"] = cooldown.inCooldown
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		entry["problem_kind"] = "disabled"
+	} else if cooldown.inCooldown {
+		entry["problem_kind"] = "cooldown"
+	} else if auth.Status == coreauth.StatusError || auth.StatusMessage != "" {
+		entry["problem_kind"] = "error"
+	}
+	if cooldown.inCooldown {
+		entry["cooldown_kind"] = cooldown.kind
+		entry["cooldown_reason"] = cooldown.reason
+		entry["cooldown_until"] = cooldown.until
+		if len(cooldown.models) > 0 {
+			entry["cooldown_models"] = cooldown.models
+		}
+	}
+	if auth.Metadata != nil {
+		if healthCheck, ok := auth.Metadata[healthCheckMetadataKey]; ok {
+			entry["health_check"] = healthCheck
+		}
+		if excludedModels := authFileExcludedModels(auth.Metadata); len(excludedModels) > 0 {
+			entry["excluded_models"] = excludedModels
+		}
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}

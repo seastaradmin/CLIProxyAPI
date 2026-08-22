@@ -918,10 +918,13 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
 			continue
 		}
-		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		if m.channelDisabled(auth.Provider) {
+			continue
+		}
+		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
 			continue
 		}
 		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {

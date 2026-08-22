@@ -21,6 +21,10 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// statusClientClosedRequest is the non-standard 499 code (nginx "Client Closed
+// Request") used to mark failures caused by the client disconnecting mid-stream.
+const statusClientClosedRequest = 499
+
 type UsageReporter struct {
 	provider     string
 	executorType string
@@ -321,6 +325,20 @@ func failFromErrors(errs ...error) usage.Failure {
 		if errors.As(err, &se) && se != nil {
 			fail.StatusCode = se.StatusCode()
 		}
+		// A client disconnect cancels the inbound request context (propagated to
+		// the upstream request), surfacing as context.Canceled with no HTTP
+		// status. Tag it as 499 (client closed request) so downstream sinks do
+		// not misreport it as a genuine upstream 500 and availability metrics can
+		// exclude it. Upstream timeouts (context.DeadlineExceeded) stay failures.
+		if fail.StatusCode <= 0 && errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			fail.StatusCode = statusClientClosedRequest
+		}
+		// Transport-level failures (DNS/dial/TLS/reset/first-byte timeout) carry
+		// no HTTP status; flag them so sinks attribute them to the network
+		// environment instead of the credential.
+		if fail.StatusCode <= 0 && usage.IsNetworkFailure(err) {
+			fail.NetworkError = true
+		}
 		return fail
 	}
 	return usage.Failure{}
@@ -467,6 +485,9 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 type StreamUsageBuffer struct {
 	detail usage.Detail
 	ok     bool
+	// claudeStream marks that the stream emits Anthropic-style usage events,
+	// so follow-up events (message_delta) keep independent token accounting.
+	claudeStream bool
 }
 
 var (
@@ -494,6 +515,9 @@ func (b *StreamUsageBuffer) Observe(detail usage.Detail, ok bool) {
 
 // ObserveOpenAIStream records response-tier state and the latest usage from an
 // OpenAI-style stream while avoiding JSON parsing for irrelevant chunks.
+// Anthropic-style usage events (message_start/message_delta) are recognized as
+// well so cache_read_input_tokens is not lost when an openai-compat channel
+// speaks the messages protocol upstream.
 func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 	if b == nil {
 		return
@@ -517,8 +541,46 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 	usageOK := false
 	if hasUsageCandidate {
 		usageNode := gjson.GetBytes(payload, "usage")
-		if hasOpenAIStyleUsageTokenFields(usageNode) {
-			detail = parseOpenAIStyleUsageNode(usageNode)
+		topLevel := usageNode.Exists()
+		if !hasOpenAIStyleUsageTokenFields(usageNode) && !hasClaudeStyleUsageTokenFields(usageNode) {
+			// Responses API nests usage under response.usage; Anthropic
+			// message_start nests it under message.usage.
+			if nested := gjson.GetBytes(payload, "response.usage"); nested.Exists() {
+				usageNode = nested
+			} else {
+				usageNode = gjson.GetBytes(payload, "message.usage")
+			}
+		}
+		// Top-level usage with input_tokens is Anthropic-style unless it carries
+		// OpenAI-only *_details buckets (some OpenAI-compat upstreams report
+		// input_tokens with input_tokens_details.cached_tokens). Responses API
+		// usage lives under response.usage and keeps OpenAI-style handling.
+		// Once an Anthropic event is seen, follow-up partial events (e.g.
+		// message_delta carrying only output_tokens) stay on the same path.
+		openAIDetails := hasOpenAIStyleUsageDetailBuckets(usageNode)
+		claudeStyle := hasClaudeStyleUsageTokenFields(usageNode) ||
+			(!openAIDetails && ((topLevel && usageNode.Get("input_tokens").Exists()) || (b.claudeStream && topLevel)))
+		switch {
+		case claudeStyle:
+			b.claudeStream = true
+			// Anthropic message_start carries input/cache tokens while
+			// message_delta carries output tokens; merge across events and
+			// rebuild the independent breakdown from the merged fields.
+			detail = mergeUsageDetails(b.detail, parseClaudeUsageNode(usageNode))
+			detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
+			detail.TokenBreakdown = usage.NewIndependentTokenBreakdown(
+				detail.InputTokens,
+				detail.CacheReadTokens,
+				detail.CacheCreationTokens,
+				detail.OutputTokens,
+				detail.ReasoningTokens,
+				detail.TotalTokens,
+			)
+			usageOK = true
+		case hasOpenAIStyleUsageTokenFields(usageNode):
+			// Merge so a trailing partial usage event cannot wipe cache
+			// metrics captured earlier in the stream.
+			detail = mergeUsageDetails(b.detail, parseOpenAIStyleUsageNode(usageNode))
 			usageOK = true
 		}
 	}
@@ -526,6 +588,61 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 		detail.ResponseServiceTier = extractResponseServiceTierFromValidJSON(payload)
 	}
 	b.Observe(detail, usageOK || detail.ResponseServiceTier != "")
+}
+
+// hasClaudeStyleUsageTokenFields reports whether a usage node uses Anthropic
+// field names (cache_read_input_tokens / cache_creation_input_tokens).
+func hasClaudeStyleUsageTokenFields(usageNode gjson.Result) bool {
+	if !usageNode.Exists() || !usageNode.IsObject() {
+		return false
+	}
+	return usageNode.Get("cache_read_input_tokens").Exists() ||
+		usageNode.Get("cache_creation_input_tokens").Exists()
+}
+
+// hasOpenAIStyleUsageDetailBuckets reports nested *_details buckets that only
+// OpenAI-style usage emits; Anthropic keeps cache fields at the top level.
+func hasOpenAIStyleUsageDetailBuckets(usageNode gjson.Result) bool {
+	if !usageNode.Exists() || !usageNode.IsObject() {
+		return false
+	}
+	return usageNode.Get("prompt_tokens_details").Exists() ||
+		usageNode.Get("input_tokens_details").Exists() ||
+		usageNode.Get("completion_tokens_details").Exists() ||
+		usageNode.Get("output_tokens_details").Exists()
+}
+
+// mergeUsageDetails fills zero token fields of next with values from prev.
+// Anthropic streams split usage across events: message_start reports input and
+// cache tokens, message_delta reports output tokens. Without merging, the
+// final event would wipe the cache metrics captured earlier in the stream.
+func mergeUsageDetails(prev, next usage.Detail) usage.Detail {
+	if next.InputTokens == 0 && next.OutputTokens == 0 &&
+		next.CacheReadTokens == 0 && next.CacheCreationTokens == 0 {
+		return next
+	}
+	if next.InputTokens == 0 {
+		next.InputTokens = prev.InputTokens
+	}
+	if next.OutputTokens == 0 {
+		next.OutputTokens = prev.OutputTokens
+	}
+	if next.CacheReadTokens == 0 {
+		next.CacheReadTokens = prev.CacheReadTokens
+	}
+	if next.CacheCreationTokens == 0 {
+		next.CacheCreationTokens = prev.CacheCreationTokens
+	}
+	if next.ReasoningTokens == 0 {
+		next.ReasoningTokens = prev.ReasoningTokens
+	}
+	if next.CachedTokens == 0 {
+		next.CachedTokens = prev.CachedTokens
+	}
+	if next.TotalTokens == 0 {
+		next.TotalTokens = prev.TotalTokens
+	}
+	return next
 }
 
 // Publish emits the latest observed usage detail, if any.
@@ -569,13 +686,26 @@ func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
 
 func ParseOpenAIUsage(data []byte) usage.Detail {
 	responseServiceTier := extractResponseServiceTier(data)
-	usageNode := gjson.ParseBytes(data).Get("usage")
-	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		return usage.Detail{ResponseServiceTier: responseServiceTier}
+	root := gjson.ParseBytes(data)
+	usageNode := root.Get("usage")
+	switch {
+	case hasClaudeStyleUsageTokenFields(usageNode):
+		detail := parseClaudeUsageNode(usageNode)
+		detail.ResponseServiceTier = responseServiceTier
+		return detail
+	case hasOpenAIStyleUsageTokenFields(usageNode):
+		detail := parseOpenAIStyleUsageNode(usageNode)
+		detail.ResponseServiceTier = responseServiceTier
+		return detail
 	}
-	detail := parseOpenAIStyleUsageNode(usageNode)
-	detail.ResponseServiceTier = responseServiceTier
-	return detail
+	// Anthropic non-stream messages responses nest usage under message.usage.
+	messageUsage := root.Get("message.usage")
+	if hasClaudeStyleUsageTokenFields(messageUsage) || hasOpenAIStyleUsageTokenFields(messageUsage) {
+		detail := parseClaudeUsageNode(messageUsage)
+		detail.ResponseServiceTier = responseServiceTier
+		return detail
+	}
+	return usage.Detail{ResponseServiceTier: responseServiceTier}
 }
 
 func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
@@ -618,6 +748,10 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	if !cached.Exists() {
 		cached = usageNode.Get("input_tokens_details.cached_tokens")
 	}
+	if !cached.Exists() {
+		// Anthropic-style usage nests cache reads at the top level.
+		cached = usageNode.Get("cache_read_input_tokens")
+	}
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
 		detail.CacheReadTokens = cached.Int()
@@ -628,6 +762,7 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		"input_tokens_details.cache_write_tokens",
 		"prompt_tokens_details.cache_creation_tokens",
 		"prompt_tokens_details.cache_write_tokens",
+		"cache_creation_input_tokens",
 	)
 	if cacheCreation.Exists() {
 		detail.CacheCreationTokens = cacheCreation.Int()

@@ -177,17 +177,28 @@ func (h *Handler) ProtocolProbeBatch(c *gin.Context) {
 			defer wg.Done()
 			protos := make(map[string]string, len(wantProtocols))
 			endpoints := make(map[string]string, len(wantProtocols))
+			var mu sync.Mutex
+			var pwg sync.WaitGroup
+			// Probe every protocol of this model concurrently: whichever
+			// returns first wins; timeouts/errors are recorded as failed.
 			for _, proto := range wantProtocols {
-				r := probeOneProtocol(c.Request.Context(), client, baseURL, apiKey, modelName, proto)
-				protos[proto] = r.Status
-				if r.Status == "success" && r.Endpoint != "" {
-					// Extract path suffix relative to base URL for storage.
-					suffix := extractEndpointSuffix(baseURL, r.Endpoint)
-					if suffix != "" {
-						endpoints[proto] = suffix
+				pwg.Add(1)
+				go func(protoName string) {
+					defer pwg.Done()
+					r := probeOneProtocol(c.Request.Context(), client, baseURL, apiKey, modelName, protoName)
+					mu.Lock()
+					protos[protoName] = r.Status
+					if r.Status == "success" && r.Endpoint != "" {
+						// Extract path suffix relative to base URL for storage.
+						suffix := extractEndpointSuffix(baseURL, r.Endpoint)
+						if suffix != "" {
+							endpoints[protoName] = suffix
+						}
 					}
-				}
+					mu.Unlock()
+				}(proto)
 			}
+			pwg.Wait()
 			results[idx] = protocolProbeBatchModelResult{
 				Model:     modelName,
 				Protocols: protos,

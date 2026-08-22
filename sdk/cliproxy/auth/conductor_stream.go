@@ -1,11 +1,17 @@
 package auth
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
@@ -71,11 +77,42 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+func (m *Manager) firstChunkTimeout() time.Duration {
+	if m == nil {
+		return internalconfig.ResolveFirstChunkTimeout(0)
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return internalconfig.ResolveFirstChunkTimeout(0)
+	}
+	return internalconfig.ResolveFirstChunkTimeout(cfg.Streaming.FirstChunkTimeoutSeconds)
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
+	return readStreamBootstrapWithTimeout(ctx, ch, 0)
+}
+
+func readStreamBootstrapWithTimeout(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, timeout time.Duration) ([]cliproxyexecutor.StreamChunk, bool, error) {
+	return readStreamBootstrapWithTimeoutFor(ctx, ch, timeout, "")
+}
+
+// readStreamBootstrapWithTimeoutFor is like readStreamBootstrapWithTimeout but,
+// when format is known, keeps buffering protocol-metadata payloads (e.g. Anthropic
+// message_start, OpenAI role deltas) until the stream produces client-visible
+// content. A stream that dies before producing content is therefore reported as a
+// retryable bootstrap failure instead of being committed to the client.
+func readStreamBootstrapWithTimeoutFor(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, timeout time.Duration, format sdktranslator.Format) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	var timeoutC <-chan time.Time
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		timeoutC = timer.C
+		defer timer.Stop()
+	}
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -85,22 +122,124 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 			select {
 			case <-ctx.Done():
 				return nil, false, ctx.Err()
+			case <-timeoutC:
+				return nil, false, &Error{
+					Code:       "first_chunk_timeout",
+					Message:    fmt.Sprintf("upstream stream produced no payload within %s", timeout),
+					Retryable:  true,
+					HTTPStatus: http.StatusGatewayTimeout,
+				}
+			case chunk, ok = <-ch:
+			}
+		} else if timeoutC != nil {
+			select {
+			case <-timeoutC:
+				return nil, false, &Error{
+					Code:       "first_chunk_timeout",
+					Message:    fmt.Sprintf("upstream stream produced no payload within %s", timeout),
+					Retryable:  true,
+					HTTPStatus: http.StatusGatewayTimeout,
+				}
 			case chunk, ok = <-ch:
 			}
 		} else {
 			chunk, ok = <-ch
 		}
 		if !ok {
+			if format != "" && len(buffered) > 0 && !streamContentBuffered(format, buffered) {
+				// The stream ended after protocol metadata but before producing any
+				// content; report a retryable bootstrap failure instead of committing
+				// an empty response to the client.
+				return nil, true, &Error{
+					Code:       "empty_stream",
+					Message:    "upstream stream closed before producing content",
+					Retryable:  true,
+					HTTPStatus: http.StatusBadGateway,
+				}
+			}
 			return buffered, true, nil
 		}
 		if chunk.Err != nil {
 			return nil, false, chunk.Err
 		}
 		buffered = append(buffered, chunk)
-		if len(chunk.Payload) > 0 {
+		if len(chunk.Payload) > 0 && isStreamContentPayload(format, chunk.Payload) {
 			return buffered, false, nil
 		}
 	}
+}
+
+// isStreamContentPayload reports whether a stream payload carries client-visible
+// model output for the given response format. Payloads that only carry protocol
+// metadata (Anthropic message_start, OpenAI role/usage deltas, etc.) are not
+// content, so a stream that dies before producing content can be retried without
+// duplicating anything the client has already seen. Unknown formats fall back to
+// treating the first payload as content (legacy behavior).
+func isStreamContentPayload(format sdktranslator.Format, payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	switch format {
+	case sdktranslator.FormatClaude, sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse, sdktranslator.FormatGemini:
+		data := sseDataPayload(payload)
+		if data == nil {
+			// No parseable JSON data line (raw passthrough, [DONE], split SSE
+			// frames); treat the payload as content so the retry window is never
+			// widened on unclassifiable data.
+			return true
+		}
+		payload = data
+	}
+	switch format {
+	case sdktranslator.FormatClaude:
+		switch gjson.GetBytes(payload, "type").String() {
+		case "content_block_delta", "message_stop":
+			// Content deltas and the protocol terminal marker both commit the
+			// stream; a completed (even empty) upstream response must not be
+			// re-executed.
+			return true
+		}
+		return false
+	case sdktranslator.FormatOpenAI:
+		return gjson.GetBytes(payload, "choices.0.delta.content").String() != "" ||
+			gjson.GetBytes(payload, "choices.0.delta.reasoning_content").String() != ""
+	case sdktranslator.FormatOpenAIResponse:
+		switch gjson.GetBytes(payload, "type").String() {
+		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.completed", "response.done":
+			return true
+		}
+		return false
+	case sdktranslator.FormatGemini:
+		return gjson.GetBytes(payload, "candidates.0.content.parts.0.text").String() != ""
+	default:
+		return true
+	}
+}
+
+// sseDataPayload extracts the JSON payload of the first SSE data line from a
+// chunk that may carry event:/id:/data: lines (a complete event frame or raw
+// upstream lines). Returns nil when the chunk carries no parseable JSON data.
+func sseDataPayload(chunk []byte) []byte {
+	for _, rawLine := range bytes.Split(chunk, []byte("\n")) {
+		line := bytes.TrimSpace(rawLine)
+		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[len("data:"):])
+		if len(data) > 0 && gjson.ValidBytes(data) {
+			return data
+		}
+	}
+	return nil
+}
+
+func streamContentBuffered(format sdktranslator.Format, buffered []cliproxyexecutor.StreamChunk) bool {
+	for _, chunk := range buffered {
+		if isStreamContentPayload(format, chunk.Payload) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, aliasResult OAuthModelAliasResult, ephemeralResult bool) *cliproxyexecutor.StreamResult {
@@ -225,14 +364,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-			if isRequestInvalidError(errStream) {
-				return nil, errStream
-			}
 			lastErr = errStream
 			continue
 		}
 
-		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+		firstChunkTimeout := m.firstChunkTimeout()
+		bootstrapFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+		buffered, closed, bootstrapErr := readStreamBootstrapWithTimeoutFor(ctx, streamResult.Chunks, firstChunkTimeout, bootstrapFormat)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
@@ -252,20 +390,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						streamResult = &cliproxyexecutor.StreamResult{}
 					} else {
 						streamResult = retryStream
-						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
+						buffered, closed, bootstrapErr = readStreamBootstrapWithTimeoutFor(ctx, streamResult.Chunks, firstChunkTimeout, bootstrapFormat)
 					}
 				}
 			}
 		}
 		if bootstrapErr != nil {
-			if isRequestInvalidError(bootstrapErr) {
-				rerr := resultErrorFromError(bootstrapErr)
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-				discardStreamChunks(streamResult.Chunks)
-				return nil, bootstrapErr
-			}
 			if idx < len(execModels)-1 {
 				rerr := resultErrorFromError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}

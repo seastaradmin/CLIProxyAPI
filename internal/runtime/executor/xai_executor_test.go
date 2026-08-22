@@ -4856,7 +4856,7 @@ func TestXAIExecutorHoistsAdditionalToolsFromInput(t *testing.T) {
 
 func TestHoistXAIAdditionalToolsFromInputMergesExistingTools(t *testing.T) {
 	in := []byte(`{"model":"grok-4.5","tools":[{"type":"function","name":"keep_me"}],"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"lookup"}]},{"type":"message","role":"user","content":"hi"}]}`)
-	out := hoistXAIAdditionalToolsFromInput(in)
+	out := promoteXAIAdditionalTools(in)
 	if gjson.GetBytes(out, "input.0.type").String() == "additional_tools" {
 		t.Fatalf("additional_tools not removed: %s", string(out))
 	}

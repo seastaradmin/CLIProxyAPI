@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cmd"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/controlplane"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -30,6 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/requestjournal"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
@@ -37,6 +39,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	log "github.com/sirupsen/logrus"
 )
@@ -565,6 +568,17 @@ func main() {
 		return
 	}
 
+	// Widen availability metric retention and the monitoring window when configured.
+	coreusage.ConfigureDefaultAvailability(time.Duration(cfg.AvailabilityRetentionHours)*time.Hour, 0)
+
+	// Enable durable request journal for management UI call logs.
+	if cfg.UsageStatisticsEnabled {
+		journalLogDir := logging.ResolveLogDirectory(cfg)
+		if journalLogDir != "" {
+			requestjournal.Enable(journalLogDir, cfg.RequestJournalKeepDays)
+		}
+	}
+
 	log.Infof("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
 
 	// Set the log level based on the configuration.
@@ -588,7 +602,14 @@ func main() {
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
 	exampleAPIKeySafeMode := shouldEnableExampleAPIKeySafeMode(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode)
+	// Control-plane integration (P1): validate control-plane keys against the
+	// shared Redis auth cache and report usage into the metering stream.
+	cpRDB := controlplane.NewRedis()
 	serverOptions := []api.ServerOption(nil)
+	if cpRDB != nil {
+		serverOptions = append(serverOptions, api.WithMiddleware(controlplane.AuthMiddleware(cpRDB)))
+		coreusage.RegisterNamedPlugin("controlplane", &controlplane.UsagePlugin{RDB: cpRDB})
+	}
 	if exampleAPIKeySafeMode {
 		matches := safemode.ExampleAPIKeys(cfg.APIKeys)
 		log.WithField("api_keys", strings.Join(matches, ",")).Error("unsafe example API key configured; proxy API endpoints disabled until api-keys is updated")

@@ -1172,7 +1172,7 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 	}
 }
 
-func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(t *testing.T) {
+func TestManager_RequestScopedErrorRotatesWithoutSuspendingAuth(t *testing.T) {
 	incompleteErr := &requestScopedStatusError{
 		status:  http.StatusRequestTimeout,
 		message: "stream error: stream disconnected before completion: stream closed before response.completed",
@@ -1181,29 +1181,16 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 		status:  http.StatusRequestEntityTooLarge,
 		message: `{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}`,
 	}
-	invalidRequestErr := &Error{
-		HTTPStatus: http.StatusBadRequest,
-		Message:    `{"error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid input."}}`,
-	}
-	badRequestErr := &Error{
-		HTTPStatus: http.StatusBadRequest,
-		Message:    `{"error":{"type":"bad_request_error","code":"invalid_value","message":"Bad input."}}`,
-	}
 	tests := []struct {
-		name       string
-		provider   string
-		stream     bool
-		err        error
-		wantStatus int
+		name     string
+		provider string
+		stream   bool
+		err      error
 	}{
-		{name: "non-streaming incomplete", err: incompleteErr, wantStatus: http.StatusRequestTimeout},
-		{name: "streaming incomplete", stream: true, err: incompleteErr, wantStatus: http.StatusRequestTimeout},
-		{name: "streaming codex websocket message too big", provider: "codex", stream: true, err: messageTooBigErr, wantStatus: http.StatusRequestEntityTooLarge},
-		{name: "streaming xai websocket message too big", provider: "xai", stream: true, err: messageTooBigErr, wantStatus: http.StatusRequestEntityTooLarge},
-		{name: "non-streaming invalid request", err: invalidRequestErr, wantStatus: http.StatusBadRequest},
-		{name: "streaming invalid request", stream: true, err: invalidRequestErr, wantStatus: http.StatusBadRequest},
-		{name: "non-streaming bad request", err: badRequestErr, wantStatus: http.StatusBadRequest},
-		{name: "streaming bad request", stream: true, err: badRequestErr, wantStatus: http.StatusBadRequest},
+		{name: "non-streaming incomplete", err: incompleteErr},
+		{name: "streaming incomplete", stream: true, err: incompleteErr},
+		{name: "streaming codex websocket message too big", provider: "codex", stream: true, err: messageTooBigErr},
+		{name: "streaming xai websocket message too big", provider: "xai", stream: true, err: messageTooBigErr},
 	}
 
 	for _, tc := range tests {
@@ -1242,22 +1229,31 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 				t.Fatalf("register good auth: %v", errRegister)
 			}
 
-			var errExecute error
 			if tc.stream {
 				result, errStream := m.ExecuteStream(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{Stream: true})
 				if result != nil {
-					for range result.Chunks {
+					var payload []byte
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							t.Fatalf("unexpected chunk error after rotation: %v", chunk.Err)
+						}
+						payload = append(payload, chunk.Payload...)
+					}
+					if len(payload) == 0 {
+						t.Fatal("expected payload from rotated credential")
 					}
 				}
-				errExecute = errStream
+				if errStream != nil {
+					t.Fatalf("stream error = %v, want rotation success", errStream)
+				}
 			} else {
-				_, errExecute = m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-			}
-			if errExecute == nil {
-				t.Fatal("expected request-scoped stream error")
-			}
-			if got := statusCodeFromError(errExecute); got != tc.wantStatus {
-				t.Fatalf("status = %d, want %d", got, tc.wantStatus)
+				resp, errExecute := m.Execute(context.Background(), []string{provider}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				if errExecute != nil {
+					t.Fatalf("execute error = %v, want rotation success", errExecute)
+				}
+				if len(resp.Payload) == 0 {
+					t.Fatal("expected payload from rotated credential")
+				}
 			}
 
 			var calls []string
@@ -1266,8 +1262,16 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 			} else {
 				calls = executor.ExecuteCalls()
 			}
-			if len(calls) != 1 || calls[0] != badAuth.ID {
-				t.Fatalf("credential calls = %v, want [%s]", calls, badAuth.ID)
+			// request-scoped errors are retried on the same credential (request-retry
+			// times) and only then rotated to the next credential.
+			wantCalls := []string{badAuth.ID, badAuth.ID, badAuth.ID, goodAuth.ID}
+			if len(calls) != len(wantCalls) {
+				t.Fatalf("credential calls = %v, want %v", calls, wantCalls)
+			}
+			for i := range wantCalls {
+				if calls[i] != wantCalls[i] {
+					t.Fatalf("credential call %d = %q, want %q", i, calls[i], wantCalls[i])
+				}
 			}
 
 			updatedBad, ok := m.GetByID(badAuth.ID)
@@ -1278,10 +1282,7 @@ func TestManager_RequestScopedErrorStopsCredentialFallbackWithoutSuspendingAuth(
 				t.Fatal("expected request-scoped error to keep auth available")
 			}
 			if !updatedBad.NextRetryAfter.IsZero() {
-				t.Fatalf("expected auth cooldown to remain unset, got %v", updatedBad.NextRetryAfter)
-			}
-			if state := updatedBad.ModelStates[model]; state != nil {
-				t.Fatalf("expected request-scoped error to avoid model cooldown state, got %#v", state)
+				t.Fatal("expected request-scoped error to keep auth out of cooldown")
 			}
 		})
 	}
@@ -1439,8 +1440,10 @@ func TestManager_ExecuteCount_ExplicitModelNotFoundSuspendsModel(t *testing.T) {
 	if remaining < 11*time.Hour || remaining > 12*time.Hour {
 		t.Fatalf("model-not-found cooldown = %v, want about 12h", remaining)
 	}
-	if count := reg.GetModelCount(model); count != 0 {
-		t.Fatalf("available model count = %d, want 0", count)
+	// 404 sets a 12h auth-level cooldown but no longer permanently suspends
+	// the model in the registry, so GetModelCount still reflects the registered client.
+	if count := reg.GetModelCount(model); count != 1 {
+		t.Fatalf("available model count = %d, want 1 (registry suspension removed for temporary 404)", count)
 	}
 }
 
@@ -1688,7 +1691,7 @@ func TestManager_RecordResult_AvailabilityNeutralSkipsSchedulerUpdate(t *testing
 	}
 }
 
-func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing.T) {
+func TestManager_RequestScopedNotFoundRotatesWithoutSuspendingAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
 		id: "openai",
@@ -1720,43 +1723,25 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 		t.Fatalf("register good auth: %v", errRegister)
 	}
 
-	_, errExecute := m.Execute(context.Background(), []string{"openai"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute == nil {
-		t.Fatal("expected request-scoped not-found error")
+	resp, errExecute := m.Execute(context.Background(), []string{"openai"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want rotation success", errExecute)
 	}
-	errResult, ok := errExecute.(*Error)
-	if !ok {
-		t.Fatalf("expected *Error, got %T", errExecute)
+	if len(resp.Payload) == 0 {
+		t.Fatal("expected payload from rotated credential")
 	}
-	if errResult.HTTPStatus != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d", errResult.HTTPStatus, http.StatusNotFound)
+	calls := executor.ExecuteCalls()
+	if len(calls) != 2 || calls[0] != badAuth.ID || calls[1] != goodAuth.ID {
+		t.Fatalf("credential calls = %v, want [%s %s]", calls, badAuth.ID, goodAuth.ID)
 	}
-	if errResult.Message != requestScopedNotFoundMessage {
-		t.Fatalf("message = %q, want %q", errResult.Message, requestScopedNotFoundMessage)
-	}
-
-	got := executor.ExecuteCalls()
-	want := []string{badAuth.ID}
-	if len(got) != len(want) {
-		t.Fatalf("execute calls = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
-		}
-	}
-
 	updatedBad, ok := m.GetByID(badAuth.ID)
 	if !ok || updatedBad == nil {
-		t.Fatalf("expected bad auth to remain registered")
+		t.Fatal("expected bad auth to remain registered")
 	}
 	if updatedBad.Unavailable {
-		t.Fatalf("expected request-scoped 404 to keep bad auth available")
+		t.Fatal("expected request-scoped error to keep auth available")
 	}
 	if !updatedBad.NextRetryAfter.IsZero() {
-		t.Fatalf("expected request-scoped 404 to keep bad auth cooldown unset, got %v", updatedBad.NextRetryAfter)
-	}
-	if state := updatedBad.ModelStates[model]; state != nil {
-		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
+		t.Fatal("expected request-scoped error to keep auth out of cooldown")
 	}
 }

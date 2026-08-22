@@ -97,17 +97,35 @@ func (h *Handler) ProbeUpstreamProtocols(c *gin.Context) {
 
 func probeOneProtocol(ctx context.Context, client *http.Client, base, apiKey, model, proto string) protocolProbeResult {
 	primary, alternate := protocolEndpointPair(base, proto)
-	result := probeOneProtocolEndpoint(ctx, client, primary, apiKey, model, proto)
-	if result.Status == "success" {
-		return result
+	if alternate == "" || alternate == primary {
+		return probeOneProtocolEndpoint(ctx, client, primary, apiKey, model, proto)
 	}
-	if alternate != "" && alternate != primary {
-		altResult := probeOneProtocolEndpoint(ctx, client, alternate, apiKey, model, proto)
-		if altResult.Status == "success" {
-			return altResult
-		}
+	// Probe both paths concurrently; whichever succeeds wins (primary
+	// takes precedence when both succeed). Failures/timeouts are returned
+	// as error results without blocking the other path.
+	type indexedResult struct {
+		idx int
+		res protocolProbeResult
 	}
-	return result
+	ch := make(chan indexedResult, 2)
+	go func() {
+		ch <- indexedResult{0, probeOneProtocolEndpoint(ctx, client, primary, apiKey, model, proto)}
+	}()
+	go func() {
+		ch <- indexedResult{1, probeOneProtocolEndpoint(ctx, client, alternate, apiKey, model, proto)}
+	}()
+	res := make([]protocolProbeResult, 2)
+	for i := 0; i < 2; i++ {
+		ir := <-ch
+		res[ir.idx] = ir.res
+	}
+	if res[0].Status == "success" {
+		return res[0]
+	}
+	if res[1].Status == "success" {
+		return res[1]
+	}
+	return res[0]
 }
 
 // protocolSuffix returns the path suffix for a given protocol.

@@ -62,6 +62,81 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatExecutorResponsesPreservesAdditionalTools(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","status":"completed","output":[]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":  server.URL,
+		"api_key":   "test",
+		"protocols": "responses",
+	}}
+	payload := []byte(`{"model":"gpt-5.6-luna","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]},{"role":"user","content":"hi"}]}`)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-luna",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.type").String(); got != "additional_tools" {
+		t.Fatalf("input.0.type = %q, want additional_tools; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.tools.0.name").String(); got != "exec" {
+		t.Fatalf("input.0.tools.0.name = %q, want exec; body=%s", got, gotBody)
+	}
+	if gjson.GetBytes(gotBody, "tools").Exists() {
+		t.Fatalf("top-level tools should not be synthesized from additional_tools: %s", gotBody)
+	}
+}
+
+func TestOpenAICompatExecutorDeepSeekFiltersUnsupportedCustomTools(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","status":"completed","output":[]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatible-deepseek", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":    server.URL,
+		"api_key":     "test",
+		"compat_name": "DeepSeek",
+		"protocols":   "responses",
+	}}
+	payload := []byte(`{"model":"deepseek-v4-flash","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"},{"type":"custom","name":"apply_patch"}]},{"role":"user","content":"hi"}],"tool_choice":{"type":"allowed_tools","tools":[{"type":"custom","name":"exec"},{"type":"custom","name":"apply_patch"}]}}`)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-v4-flash",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.tools.#(name==\"exec\")"); got.Exists() {
+		t.Fatalf("exec tool was not filtered from additional_tools: %s", gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.tools.0.name").String(); got != "apply_patch" {
+		t.Fatalf("input.0.tools.0.name = %q, want apply_patch; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "tool_choice.tools.#(name==\"exec\")"); got.Exists() {
+		t.Fatalf("exec tool was not filtered from tool_choice: %s", gotBody)
+	}
+}
+
 func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

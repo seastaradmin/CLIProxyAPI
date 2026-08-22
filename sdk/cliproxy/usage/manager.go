@@ -28,7 +28,9 @@ type Record struct {
 	APIKey       string
 	AuthID       string
 	AuthIndex    string
-	AuthType     string
+	// AccessTokenSHA256 identifies the OAuth token version without exposing the token.
+	AccessTokenSHA256 string
+	AuthType          string
 	// BaseURL is the upstream channel base URL when known (openai-compat etc).
 	BaseURL string
 	// Protocol is the upstream protocol label used for this attempt (chat/responses/messages).

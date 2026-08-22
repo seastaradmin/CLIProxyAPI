@@ -63,6 +63,7 @@ _bmad-output/*
 cli-proxy-api.bak-*
 cli-proxy-api-*
 cli-proxy-api.before-release-*
+cli-proxy-api.before-release.*
 cliproxyapi
 /cpactl
 .codegraph/
@@ -71,6 +72,7 @@ management-center/
 CPA-Manager-Plus/
 .scratch/
 .qoder/
+.zcode/
 
 # Runtime state and deployment artifacts
 availability-state.json

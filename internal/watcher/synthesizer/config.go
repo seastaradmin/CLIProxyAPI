@@ -21,11 +21,25 @@ func NewConfigSynthesizer() *ConfigSynthesizer {
 	return &ConfigSynthesizer{}
 }
 
+func addWeightToAttrs(weight *int, attrs map[string]string) {
+	if weight == nil {
+		return
+	}
+	normalized := *weight
+	if normalized <= 0 {
+		normalized = 0
+	}
+	attrs[coreauth.AttributeWeight] = strconv.Itoa(normalized)
+}
+
 // Synthesize generates Auth entries from config API keys.
 func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, error) {
 	out := make([]*coreauth.Auth, 0, 32)
 	if ctx == nil || ctx.Config == nil {
 		return out, nil
+	}
+	if errValidate := ctx.Config.ValidateCredentialWeights(); errValidate != nil {
+		return nil, fmt.Errorf("synthesize config API key auths: %w", errValidate)
 	}
 
 	// Gemini API Keys
@@ -73,8 +87,9 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 		proxyURL := strings.TrimSpace(entry.ProxyURL)
 		id, token := idGen.Next(idKind, key, base)
 		attrs := map[string]string{
-			"source":  fmt.Sprintf("config:%s[%s]", sourceName, token),
-			"api_key": key,
+			"source":       fmt.Sprintf("config:%s[%s]", sourceName, token),
+			"api_key":      key,
+			"config_index": strconv.Itoa(i),
 		}
 		metadata := map[string]any{}
 		if entry.DisableCooling {
@@ -83,6 +98,7 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 		if entry.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(entry.Priority)
 		}
+		addWeightToAttrs(entry.Weight, attrs)
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -128,8 +144,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		base := strings.TrimSpace(ck.BaseURL)
 		id, token := idGen.Next("claude:apikey", key, base)
 		attrs := map[string]string{
-			"source":  fmt.Sprintf("config:claude[%s]", token),
-			"api_key": key,
+			"source":       fmt.Sprintf("config:claude[%s]", token),
+			"api_key":      key,
+			"config_index": strconv.Itoa(i),
 		}
 		metadata := map[string]any{}
 		if ck.DisableCooling {
@@ -138,6 +155,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
 		}
+		addWeightToAttrs(ck.Weight, attrs)
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -196,8 +214,9 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		baseURL := strings.TrimSpace(entry.BaseURL)
 		id, token := idGen.Next(provider+":apikey", key, baseURL)
 		attrs := map[string]string{
-			"source":  fmt.Sprintf("config:%s[%s]", provider, token),
-			"api_key": key,
+			"source":       fmt.Sprintf("config:%s[%s]", provider, token),
+			"api_key":      key,
+			"config_index": strconv.Itoa(i),
 		}
 		metadata := map[string]any{}
 		if entry.DisableCooling {
@@ -206,6 +225,7 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		if entry.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(entry.Priority)
 		}
+		addWeightToAttrs(entry.Weight, attrs)
 		if baseURL != "" {
 			attrs["base_url"] = baseURL
 		}
@@ -272,6 +292,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"compat_name":  compat.Name,
 				"provider_key": internalProviderKey,
 				"protocols":    util.ProtocolsCSV(compat.Protocols),
+				"config_index": strconv.Itoa(i),
 			}
 			if compat.ResponseHeaderTimeoutSeconds != 0 {
 				attrs["response_header_timeout_seconds"] = strconv.Itoa(compat.ResponseHeaderTimeoutSeconds)
@@ -283,6 +304,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
 			}
+			addWeightToAttrs(entry.Weight, attrs)
 			if key != "" {
 				attrs["api_key"] = key
 			}
@@ -325,6 +347,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"compat_name":  compat.Name,
 				"provider_key": internalProviderKey,
 				"protocols":    util.ProtocolsCSV(compat.Protocols),
+				"config_index": strconv.Itoa(i),
 			}
 			if compat.ResponseHeaderTimeoutSeconds != 0 {
 				attrs["response_header_timeout_seconds"] = strconv.Itoa(compat.ResponseHeaderTimeoutSeconds)
@@ -381,10 +404,12 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			"source":       fmt.Sprintf("config:vertex-apikey[%s]", token),
 			"base_url":     base,
 			"provider_key": providerName,
+			"config_index": strconv.Itoa(i),
 		}
 		if compat.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(compat.Priority)
 		}
+		addWeightToAttrs(compat.Weight, attrs)
 		if key != "" {
 			attrs["api_key"] = key
 		}

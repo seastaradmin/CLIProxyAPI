@@ -41,6 +41,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if errExec == nil {
 			return resp, nil
 		}
+		if isRequestTerminatedError(errExec) {
+			return cliproxyexecutor.Response{}, errExec
+		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
@@ -83,6 +86,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if errExec == nil {
 			return resp, nil
 		}
+		if isRequestTerminatedError(errExec) {
+			return cliproxyexecutor.Response{}, errExec
+		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
@@ -121,6 +127,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if errStream == nil {
 			return result, nil
 		}
+		if isRequestTerminatedError(errStream) {
+			return nil, errStream
+		}
 		lastErr = errStream
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
@@ -151,9 +160,14 @@ type requestToFormatResolver interface {
 	RequestToFormat(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format
 }
 
-func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExecutor, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options) {
+func isRequestTerminatedError(err error) bool {
+	var terminated *cliproxyexecutor.RequestTerminatedError
+	return errors.As(err, &terminated) && terminated != nil
+}
+
+func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExecutor, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
 	if opts.RequestAfterAuthInterceptor == nil {
-		return req, opts
+		return req, opts, nil
 	}
 	toFormat := requestToFormat(provider, executor, req, opts)
 	resp := opts.RequestAfterAuthInterceptor(ctx, cliproxyexecutor.RequestAfterAuthInterceptRequest{
@@ -171,7 +185,14 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		req.Payload = bytes.Clone(resp.Body)
 		opts.OriginalRequest = bytes.Clone(resp.Body)
 	}
-	return req, opts
+	if resp.Terminate {
+		return req, opts, &cliproxyexecutor.RequestTerminatedError{
+			HTTPStatus: resp.StatusCode,
+			Header:     cloneRequestHeaders(resp.ResponseHeaders),
+			Body:       bytes.Clone(resp.ResponseBody),
+		}
+	}
+	return req, opts, nil
 }
 
 func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
@@ -274,9 +295,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
 		tried[auth.ID] = struct{}{}
-
-		// Same-credential retry loop (mirrors executeStreamMixedOnce): retry the
-		// same credential up to request-retry times before falling back.
 		sameAuthRetries := 0
 		sameAuthRetryLimit := m.sameCredentialRetryLimit(auth)
 		for {
@@ -287,8 +305,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
-			models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
+			models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 			if len(models) == 0 {
+				lastErr = &Error{Code: "auth_not_found", Message: "no execution models available"}
 				break
 			}
 			attempted[auth.ID] = struct{}{}
@@ -310,7 +329,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					execReq.Model = executionModel
 				}
 				execOpts := opts
-				execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+				var errIntercept error
+				execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+				if errIntercept != nil {
+					return cliproxyexecutor.Response{}, errIntercept
+				}
+				if !restoreExecutionModel {
+					execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
+				}
 				resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 				if errExec != nil {
 					if errCtx := execCtx.Err(); errCtx != nil {
@@ -338,7 +364,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					continue
 				}
 				m.MarkResult(execCtx, result)
-				rewriteForceMappedResponse(&resp, aliasResult)
+				attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
+				rewriteForceMappedResponse(&resp, attemptAliasResult)
 				return resp, nil
 			}
 			if !homeMode && sameAuthRetries < sameAuthRetryLimit && isSameCredentialRetryable(authErr) {
@@ -354,7 +381,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 	}
 }
-
 func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
 	if len(providers) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -391,9 +417,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
 		tried[auth.ID] = struct{}{}
-
-		// Same-credential retry loop (mirrors executeStreamMixedOnce): retry the
-		// same credential up to request-retry times before falling back.
 		sameAuthRetries := 0
 		sameAuthRetryLimit := m.sameCredentialRetryLimit(auth)
 		for {
@@ -404,8 +427,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
-			models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
+			models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 			if len(models) == 0 {
+				lastErr = &Error{Code: "auth_not_found", Message: "no execution models available"}
 				break
 			}
 			attempted[auth.ID] = struct{}{}
@@ -427,7 +451,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					execReq.Model = executionModel
 				}
 				execOpts := opts
-				execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+				var errIntercept error
+				execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+				if errIntercept != nil {
+					return cliproxyexecutor.Response{}, errIntercept
+				}
+				if !restoreExecutionModel {
+					execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
+				}
 				resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 				if errExec != nil {
 					if errCtx := execCtx.Err(); errCtx != nil {
@@ -450,10 +481,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					if ra := retryAfterFromError(errExec); ra != nil {
 						result.RetryAfter = ra
 					}
-					// Some Anthropic-compatible upstreams do not implement the
-					// count_tokens route and return a generic endpoint 404. Record
-					// the failure for hooks and metrics without suspending a model
-					// that remains usable through the messages endpoint.
 					if isCountTokensEndpointNotFoundError(errExec, execReq.Model) {
 						m.recordAvailabilityNeutralResult(execCtx, result)
 					} else {
@@ -463,7 +490,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					continue
 				}
 				m.MarkResult(execCtx, result)
-				rewriteForceMappedResponse(&resp, aliasResult)
+				attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, upstreamModel, aliasResult)
+				rewriteForceMappedResponse(&resp, attemptAliasResult)
 				return resp, nil
 			}
 			if !homeMode && sameAuthRetries < sameAuthRetryLimit && isSameCredentialRetryable(authErr) {
@@ -479,7 +507,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 	}
 }
-
 func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (*cliproxyexecutor.StreamResult, error) {
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -544,12 +571,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		publishSelectedAuthMetadata(opts.Metadata, auth)
 
 		tried[auth.ID] = struct{}{}
-
-		// Retry the same credential up to the configured request-retry limit before
-		// falling back to another credential. Same-credential retries bypass the
-		// selector (cooldown marks recorded by MarkResult do not block them), and
-		// only the retry-exhausted failure is reported upward so the selector can
-		// skip the cooled-down credential on the next pick.
 		sameAuthRetries := 0
 		sameAuthRetryLimit := m.sameCredentialRetryLimit(auth)
 		for {
@@ -567,7 +588,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 				execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 			}
-			models, pooled, aliasResult := m.preparedExecutionModelsWithAlias(auth, routeModel)
+			models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 			if selection != nil && aliasResult.ForceMapping && responseAlias != "" {
 				aliasResult.OriginalAlias = responseAlias
 			}
@@ -578,6 +599,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 						return nil, errEnd
 					}
 				}
+				lastErr = &Error{Code: "auth_not_found", Message: "no execution models available"}
 				break
 			}
 			attempted[auth.ID] = struct{}{}
@@ -603,6 +625,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				break
 			}
+
 			execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 			streamExecutionModel := ""
 			if restoreExecutionModel {
@@ -616,7 +639,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				models = models[:1]
 				pooled = false
 			}
-			streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, !homeMode, selection != nil)
+			streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode, selection != nil)
 			if errStream == nil {
 				if selection != nil {
 					if m.retainHomeWebsocketSelection(ctx, opts, routeModel, selection) {

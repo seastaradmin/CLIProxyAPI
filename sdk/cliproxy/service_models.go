@@ -2,10 +2,12 @@ package cliproxy
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -197,7 +199,29 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 					isCompatAuth = true
 				}
 			}
-			if cached, ok := compatCache.lookup(compatName); ok {
+			registerCompat := func(compat *config.OpenAICompatibility) bool {
+				if compat == nil || compat.Disabled {
+					return false
+				}
+				isCompatAuth = true
+				ms := buildOpenAICompatibilityConfigModels(compat)
+				if providerKey == "" {
+					providerKey = "openai-compatibility"
+				}
+				if len(ms) > 0 {
+					ms = s.appendPluginModels(providerKey, ms)
+					s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
+				} else {
+					ms = s.appendPluginModels(providerKey, nil)
+					if len(ms) > 0 {
+						s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
+					} else {
+						GlobalModelRegistry().UnregisterClient(a.ID)
+					}
+				}
+				return true
+			}
+			if cached, ok := compatCache.lookup(a, compatName); ok {
 				isCompatAuth = true
 				if providerKey == "" {
 					providerKey = cached.providerKey
@@ -234,6 +258,9 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 				}
 				return
 			}
+			if indexed := configEntryForAuthIndex(a, s.cfg.OpenAICompatibility); indexed != nil && registerCompat(indexed) {
+				return
+			}
 			for i := range s.cfg.OpenAICompatibility {
 				compat := &s.cfg.OpenAICompatibility[i]
 				if compat.Disabled {
@@ -251,14 +278,13 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 					if ms == nil {
 						ms = buildOpenAICompatibilityConfigModels(compat)
 					}
-					// Honor per-key/global excluded-models so disabled models are
-					// not registered (and thus never selected during failover).
+					// Honor per-key/global excluded-models so disabled models are not
+					// registered (and thus never selected during failover).
 					ms = applyExcludedModels(ms, excluded)
-					// Register and return
+					if providerKey == "" {
+						providerKey = "openai-compatibility"
+					}
 					if len(ms) > 0 {
-						if providerKey == "" {
-							providerKey = "openai-compatibility"
-						}
 						ms = s.appendPluginModels(providerKey, ms)
 						s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 					} else {
@@ -373,9 +399,23 @@ func (s *Service) latestAuthForModelRegistration(authID string) (*coreauth.Auth,
 	return auth, true
 }
 
+func configEntryForAuthIndex[T any](auth *coreauth.Auth, entries []T) *T {
+	if auth == nil || auth.AuthSourceKind() != coreauth.AuthSourceConfig || auth.Attributes == nil {
+		return nil
+	}
+	index, errIndex := strconv.Atoi(strings.TrimSpace(auth.Attributes[coreauth.AttributeConfigIndex]))
+	if errIndex != nil || index < 0 || index >= len(entries) {
+		return nil
+	}
+	return &entries[index]
+}
+
 func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey {
 	if auth == nil || s.cfg == nil {
 		return nil
+	}
+	if entry := configEntryForAuthIndex(auth, s.cfg.ClaudeKey); entry != nil {
+		return entry
 	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {
@@ -430,6 +470,9 @@ func (s *Service) resolveConfigGeminiKeyEntry(auth *coreauth.Auth, entries []con
 	if auth == nil || s.cfg == nil {
 		return nil
 	}
+	if entry := configEntryForAuthIndex(auth, entries); entry != nil {
+		return entry
+	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
@@ -455,6 +498,9 @@ func (s *Service) resolveConfigGeminiKeyEntry(auth *coreauth.Auth, entries []con
 func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.VertexCompatKey {
 	if auth == nil || s.cfg == nil {
 		return nil
+	}
+	if entry := configEntryForAuthIndex(auth, s.cfg.VertexCompatAPIKey); entry != nil {
+		return entry
 	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {
@@ -503,6 +549,9 @@ func (s *Service) resolveConfigXAIKey(auth *coreauth.Auth) *config.XAIKey {
 func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey) *config.CodexKey {
 	if auth == nil {
 		return nil
+	}
+	if entry := configEntryForAuthIndex(auth, entries); entry != nil {
+		return entry
 	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {
@@ -664,6 +713,7 @@ type modelEntry interface {
 	GetName() string
 	GetAlias() string
 	GetDisplayName() string
+	GetThinking() *registry.ThinkingSupport
 }
 
 func buildConfiguredModelInfo(model modelEntry, ownedBy, modelType string, created int64, fallbackDisplayName string, userDefined bool) *ModelInfo {
@@ -724,11 +774,11 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		if info == nil {
 			continue
 		}
-		thinking := model.Thinking
-		if thinking == nil && !model.Image {
-			thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
+		thinkingSupport := model.Thinking
+		if thinkingSupport == nil && !model.Image {
+			thinkingSupport = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 		}
-		info.Thinking = thinking
+		info.Thinking = modelconfig.NormalizeThinkingSupport(thinkingSupport)
 		info.SupportedInputModalities = normalizeCompatConfigModalities(model.InputModalities)
 		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)
 		name := strings.TrimSpace(model.Name)
@@ -902,10 +952,8 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 			continue
 		}
 		seen[key] = struct{}{}
-		if name != "" {
-			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
-				info.Thinking = upstream.Thinking
-			}
+		if resolved := modelconfig.ResolveModelInfo(name, modelType, model.GetThinking()); resolved.Thinking != nil {
+			info.Thinking = resolved.Thinking
 		}
 		out = append(out, info)
 	}

@@ -24,6 +24,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+var benchmarkBuildCodexWebsocketRequestBodyOutput []byte
+
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)
 
@@ -40,6 +42,16 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
+	}
+}
+
+func BenchmarkBuildCodexWebsocketRequestBodyLargePayload(b *testing.B) {
+	body := []byte(`{"model":"gpt-5.6","input":[{"type":"message","id":"msg_1","role":"user","content":"` + strings.Repeat("x", 8<<20) + `"}]}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkBuildCodexWebsocketRequestBodyOutput = buildCodexWebsocketRequestBody(body)
 	}
 }
 
@@ -1626,6 +1638,83 @@ func TestApplyCodexHeadersDefaultsToCodexCloaking(t *testing.T) {
 	}
 	if got := req.Header.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
+	}
+}
+
+func TestApplyCodexHeaders_EmptyAPIKey_OmitsAuthorizationAndOAuthHeaders(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"auth_kind": "apikey",
+			"base_url":  "https://custom-codex.example.com",
+		},
+		Metadata: map[string]any{
+			"account_id": "acc-12345",
+		},
+	}
+	cfg := &config.Config{
+		Codex: config.CodexConfig{
+			DisableCodexCloaking: true,
+		},
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			UserAgent: "oauth-default-ua",
+		},
+	}
+	applyCodexHeaders(req, auth, "", false, cfg)
+
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization = %q, want empty for empty API key", got)
+	}
+	if got := req.Header.Get("Chatgpt-Account-Id"); got != "" {
+		t.Fatalf("Chatgpt-Account-Id = %q, want empty for API key auth_kind", got)
+	}
+	if got := req.Header.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty for API key auth_kind when client originator omitted", got)
+	}
+	if got := req.Header.Get("User-Agent"); got == "oauth-default-ua" {
+		t.Fatalf("User-Agent unexpectedly used OAuth default UA %q for API key auth_kind", got)
+	}
+}
+
+func TestApplyCodexWebsocketHeaders_EmptyAPIKey_OmitsAuthorizationAndOAuthHeaders(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"auth_kind": "apikey",
+			"base_url":  "https://custom-codex.example.com",
+		},
+		Metadata: map[string]any{
+			"account_id": "acc-ws-123",
+		},
+	}
+	cfg := &config.Config{
+		Codex: config.CodexConfig{
+			DisableCodexCloaking: true,
+		},
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			UserAgent:    "oauth-default-ua",
+			BetaFeatures: "oauth-beta",
+		},
+	}
+	headers := applyCodexWebsocketHeaders(context.Background(), nil, auth, "", cfg)
+	if got := headers.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization = %q, want empty for empty API key", got)
+	}
+	if got := headers.Get("ChatGPT-Account-ID"); got != "" {
+		t.Fatalf("ChatGPT-Account-ID = %q, want empty for API key auth_kind", got)
+	}
+	if got := headers.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty for API key auth_kind", got)
+	}
+	if got := headers.Get("x-codex-beta-features"); got != "" {
+		t.Fatalf("x-codex-beta-features = %q, want empty for API key auth_kind", got)
+	}
+	if got := headers.Get("User-Agent"); got == "oauth-default-ua" {
+		t.Fatalf("User-Agent unexpectedly used OAuth default UA %q for API key auth_kind", got)
 	}
 }
 

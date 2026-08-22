@@ -269,7 +269,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				if errMsg, okPendingErr := pendingClaudeStreamError(errChan); okPendingErr {
+				if errMsg, okPendingErr := handlers.PendingStreamError(errChan); okPendingErr {
 					h.maybeMarkStreamInterruptionRetryable(errMsg)
 					h.WriteErrorResponse(c, errMsg)
 					if errMsg != nil {
@@ -301,21 +301,6 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}
-	}
-}
-
-func pendingClaudeStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces.ErrorMessage, bool) {
-	if errs == nil {
-		return nil, false
-	}
-	select {
-	case errMsg, ok := <-errs:
-		if !ok {
-			return nil, false
-		}
-		return errMsg, true
-	default:
-		return nil, false
 	}
 }
 

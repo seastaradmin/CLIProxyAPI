@@ -217,7 +217,7 @@ func readOpenAICompatStreamPayload(t *testing.T, streamResult *cliproxyexecutor.
 	return string(payload)
 }
 
-func TestManagerExecuteCount_OpenAICompatAliasPoolRotatesOnInvalidRequest(t *testing.T) {
+func TestManagerExecuteCount_OpenAICompatAliasPoolStopsOnInvalidRequest(t *testing.T) {
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusUnprocessableEntity, Message: "unprocessable entity"}
 	executor := &openAICompatPoolExecutor{
@@ -229,18 +229,13 @@ func TestManagerExecuteCount_OpenAICompatAliasPoolRotatesOnInvalidRequest(t *tes
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	if _, err := m.ExecuteCount(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{}); err != nil {
-		t.Fatalf("execute count error = %v, want rotation success", err)
+	_, err := m.ExecuteCount(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if err == nil || err.Error() != invalidErr.Error() {
+		t.Fatalf("execute count error = %v, want %v", err, invalidErr)
 	}
 	got := executor.CountModels()
-	want := []string{"deepseek-v3.1", "glm-5"}
-	if len(got) != len(want) {
-		t.Fatalf("count calls = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("count call %d model = %q, want %q", i, got[i], want[i])
-		}
+	if len(got) != 1 || got[0] != "deepseek-v3.1" {
+		t.Fatalf("count calls = %v, want only first invalid model", got)
 	}
 }
 func TestResolveModelAliasPoolFromConfigModels(t *testing.T) {
@@ -344,7 +339,7 @@ func TestManagerExecute_OpenAICompatAliasPoolForceMappingRotatesAndRewritesRespo
 	}
 }
 
-func TestManagerExecute_OpenAICompatAliasPoolRotatesOnBadRequest(t *testing.T) {
+func TestManagerExecute_OpenAICompatAliasPoolStopsOnBadRequest(t *testing.T) {
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"}
 	executor := &openAICompatPoolExecutor{
@@ -356,22 +351,13 @@ func TestManagerExecute_OpenAICompatAliasPoolRotatesOnBadRequest(t *testing.T) {
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	resp, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("execute error = %v, want rotation success", err)
-	}
-	if string(resp.Payload) != "glm-5" {
-		t.Fatalf("payload = %q, want %q", string(resp.Payload), "glm-5")
+	_, err := m.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if err == nil || err.Error() != invalidErr.Error() {
+		t.Fatalf("execute error = %v, want %v", err, invalidErr)
 	}
 	got := executor.ExecuteModels()
-	want := []string{"deepseek-v3.1", "glm-5"}
-	if len(got) != len(want) {
-		t.Fatalf("execute calls = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("execute call %d model = %q, want %q", i, got[i], want[i])
-		}
+	if len(got) != 1 || got[0] != "deepseek-v3.1" {
+		t.Fatalf("execute calls = %v, want only first invalid model", got)
 	}
 }
 
@@ -576,7 +562,7 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolFallsBackBeforeFirstByte(t *t
 	}
 }
 
-func TestManagerExecuteStream_OpenAICompatAliasPoolRotatesOnInvalidRequest(t *testing.T) {
+func TestManagerExecuteStream_OpenAICompatAliasPoolStopsOnInvalidRequest(t *testing.T) {
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusUnprocessableEntity, Message: "unprocessable entity"}
 	executor := &openAICompatPoolExecutor{
@@ -588,22 +574,13 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolRotatesOnInvalidRequest(t *te
 		{Name: "glm-5", Alias: alias},
 	}, executor)
 
-	streamResult, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("execute stream error = %v, want rotation success", err)
-	}
-	if payload := readOpenAICompatStreamPayload(t, streamResult); payload != "glm-5" {
-		t.Fatalf("stream payload = %q, want %q", payload, "glm-5")
+	_, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if err == nil || err.Error() != invalidErr.Error() {
+		t.Fatalf("execute stream error = %v, want %v", err, invalidErr)
 	}
 	got := executor.StreamModels()
-	want := []string{"deepseek-v3.1", "glm-5"}
-	if len(got) != len(want) {
-		t.Fatalf("stream calls = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("stream call %d model = %q, want %q", i, got[i], want[i])
-		}
+	if len(got) != 1 || got[0] != "deepseek-v3.1" {
+		t.Fatalf("stream calls = %v, want only first invalid model", got)
 	}
 }
 
@@ -832,7 +809,7 @@ func TestManagerExecute_OpenAICompatAliasPoolBlockedAuthDoesNotConsumeRetryBudge
 	}
 }
 
-func TestManagerExecuteStream_OpenAICompatAliasPoolRotatesOnInvalidBootstrap(t *testing.T) {
+func TestManagerExecuteStream_OpenAICompatAliasPoolStopsOnInvalidBootstrap(t *testing.T) {
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error: malformed payload"}
 	executor := &openAICompatPoolExecutor{
@@ -845,20 +822,16 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolRotatesOnInvalidBootstrap(t *
 	}, executor)
 
 	streamResult, err := m.ExecuteStream(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("execute stream error = %v, want rotation success", err)
+	if err == nil {
+		t.Fatal("expected invalid request error")
 	}
-	if payload := readOpenAICompatStreamPayload(t, streamResult); payload != "glm-5" {
-		t.Fatalf("stream payload = %q, want %q", payload, "glm-5")
+	if err != invalidErr {
+		t.Fatalf("error = %v, want %v", err, invalidErr)
 	}
-	got := executor.StreamModels()
-	want := []string{"deepseek-v3.1", "glm-5"}
-	if len(got) != len(want) {
-		t.Fatalf("stream calls = %v, want %v", got, want)
+	if streamResult != nil {
+		t.Fatalf("streamResult = %#v, want nil on invalid bootstrap", streamResult)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("stream call %d model = %q, want %q", i, got[i], want[i])
-		}
+	if got := executor.StreamModels(); len(got) != 1 || got[0] != "deepseek-v3.1" {
+		t.Fatalf("stream calls = %v, want only first upstream model", got)
 	}
 }

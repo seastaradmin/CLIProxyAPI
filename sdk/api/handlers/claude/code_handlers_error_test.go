@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 )
 
@@ -88,7 +89,7 @@ func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
 	errs <- wantErr
 	close(errs)
 
-	gotErr, ok := pendingClaudeStreamError(errs)
+	gotErr, ok := handlers.PendingStreamError(errs)
 	if !ok {
 		t.Fatal("expected pending stream error")
 	}

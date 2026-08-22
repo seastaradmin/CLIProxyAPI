@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -242,6 +244,10 @@ func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) {
 	r.publishWithOutcome(ctx, usage.Detail{}, true, failFromErrors(errs...))
 }
 
+func (r *UsageReporter) PublishFailureWithDetail(ctx context.Context, detail usage.Detail, errs ...error) {
+	r.publishWithOutcome(ctx, detail, true, failFromErrors(errs...))
+}
+
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
 	if r == nil || errPtr == nil {
 		return
@@ -342,7 +348,8 @@ func failFromErrors(errs ...error) usage.Failure {
 			continue
 		}
 		fail := usage.Failure{
-			Body: strings.TrimSpace(err.Error()),
+			Body:       strings.TrimSpace(err.Error()),
+			StatusCode: clienterror.HTTPStatusFromError(err),
 		}
 		var se interface{ StatusCode() int }
 		if errors.As(err, &se) && se != nil {
@@ -359,8 +366,12 @@ func failFromErrors(errs ...error) usage.Failure {
 		// Transport-level failures (DNS/dial/TLS/reset/first-byte timeout) carry
 		// no HTTP status; flag them so sinks attribute them to the network
 		// environment instead of the credential.
-		if fail.StatusCode <= 0 && usage.IsNetworkFailure(err) {
+		if usage.IsNetworkFailure(err) {
 			fail.NetworkError = true
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) {
+				fail.StatusCode = 0
+			}
 		}
 		return fail
 	}
@@ -677,6 +688,15 @@ func (b *StreamUsageBuffer) Publish(ctx context.Context, reporter *UsageReporter
 	return true
 }
 
+// PublishFailure emits the latest observed usage detail together with failure details.
+func (b *StreamUsageBuffer) PublishFailure(ctx context.Context, reporter *UsageReporter, errs ...error) bool {
+	if b == nil || reporter == nil {
+		return false
+	}
+	reporter.PublishFailureWithDetail(ctx, b.detail, errs...)
+	return true
+}
+
 // Detail returns the latest observed usage detail.
 func (b *StreamUsageBuffer) Detail() (usage.Detail, bool) {
 	if b == nil || !b.ok {
@@ -877,9 +897,32 @@ func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	cacheReadTokens := usageNode.Get("cache_read_input_tokens").Int()
 	cacheCreationTokens := usageNode.Get("cache_creation_input_tokens").Int()
+	rawOutputTokens := usageNode.Get("output_tokens").Int()
+	// Anthropic reports thinking as a subset of output_tokens. Prefer the official
+	// nested field, then fall back to legacy aliases used by some gateways.
+	reasoningNode := firstExistingUsageNode(
+		usageNode,
+		"output_tokens_details.thinking_tokens",
+		"output_tokens_details.reasoning_tokens",
+		"thinking_tokens",
+	)
+	reasoningTokens := reasoningNode.Int()
+	if reasoningTokens < 0 {
+		reasoningTokens = 0
+	}
+	nonReasoningOutput := rawOutputTokens
+	if reasoningTokens > 0 && reasoningTokens <= rawOutputTokens {
+		nonReasoningOutput = rawOutputTokens - reasoningTokens
+	} else if reasoningTokens > rawOutputTokens {
+		// Keep Detail.OutputTokens authoritative for keeper subset checks and
+		// avoid inventing extra non-reasoning output when the upstream payload
+		// is inconsistent.
+		nonReasoningOutput = 0
+	}
 	detail := usage.Detail{
 		InputTokens:         usageNode.Get("input_tokens").Int(),
-		OutputTokens:        usageNode.Get("output_tokens").Int(),
+		OutputTokens:        rawOutputTokens,
+		ReasoningTokens:     reasoningTokens,
 		CachedTokens:        cacheReadTokens,
 		CacheReadTokens:     cacheReadTokens,
 		CacheCreationTokens: cacheCreationTokens,
@@ -887,12 +930,14 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	if detail.CachedTokens == 0 {
 		detail.CachedTokens = detail.CacheCreationTokens
 	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
+	// raw output_tokens already includes thinking; cache fields are independent
+	// from input_tokens in the Messages API.
+	detail.TotalTokens = detail.InputTokens + rawOutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
 	detail.TokenBreakdown = usage.NewIndependentTokenBreakdown(
 		detail.InputTokens,
 		detail.CacheReadTokens,
 		detail.CacheCreationTokens,
-		detail.OutputTokens,
+		nonReasoningOutput,
 		detail.ReasoningTokens,
 		detail.TotalTokens,
 	)
@@ -1053,7 +1098,11 @@ func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 	if !node.Exists() {
 		return usage.Detail{}, false
 	}
-	return parseGeminiFamilyUsageDetail(node), true
+	detail := parseGeminiFamilyUsageDetail(node)
+	if !hasNonZeroTokenUsage(detail) {
+		return usage.Detail{}, false
+	}
+	return detail, true
 }
 
 func firstExistingUsageNode(root gjson.Result, paths ...string) gjson.Result {

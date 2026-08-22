@@ -73,7 +73,7 @@ type Config struct {
 	// are retained. Default: 30. Set to 0 to keep the default.
 	RequestJournalKeepDays int `yaml:"request-journal-keep-days" json:"request-journal-keep-days"`
 
-	// DisableCooling disables quota cooldown scheduling when true.
+	// DisableCooling disables auth/model cooldown scheduling when true unless a credential or provider overrides it.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
 	// SaveCooldownStatus persists runtime cooldown status next to auth files when true.
@@ -87,12 +87,17 @@ type Config struct {
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
 
-	// RequestRetry defines the retry times when the request failed.
+	// RequestRetry defines the number of additional credential retry rounds after
+	// the first round has exhausted its eligible credentials.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
-	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
+	// MaxRetryCredentials defines the maximum number of different credentials to
+	// try in each credential retry round.
 	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
-	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
+	// MaxRetryInterval defines the maximum positive cooldown wait, in seconds,
+	// allowed before starting another credential retry round. A non-positive value
+	// forbids positive cooldown waits; it does not disable same-round credential
+	// failover or immediate additional rounds allowed by RequestRetry.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
@@ -110,6 +115,9 @@ type Config struct {
 	AntigravitySignatureCacheEnabled *bool `yaml:"antigravity-signature-cache-enabled,omitempty" json:"antigravity-signature-cache-enabled,omitempty"`
 
 	AntigravitySignatureBypassStrict *bool `yaml:"antigravity-signature-bypass-strict,omitempty" json:"antigravity-signature-bypass-strict,omitempty"`
+
+	// Antigravity configures provider-wide Antigravity request behavior.
+	Antigravity AntigravityConfig `yaml:"antigravity" json:"antigravity"`
 
 	// GeminiKey defines Gemini API key configurations with optional routing overrides.
 	GeminiKey []GeminiKey `yaml:"gemini-api-key" json:"gemini-api-key"`
@@ -173,6 +181,12 @@ type Config struct {
 	// aistudio, antigravity, claude, codex, kimi, xai. Existing per-credential disabled
 	// flags and API-key provider disabled fields take precedence and remain independent.
 	OAuthDisabledChannels map[string]bool `yaml:"oauth-disabled-channels,omitempty" json:"oauth-disabled-channels,omitempty"`
+
+	// OAuthRequestScopedErrors defines per-provider request-scoped error rules applied to OAuth/file-backed auth entries.
+	// Supported channels include: vertex, aistudio, antigravity, claude, codex, kimi, xai, and OAuth plugin provider keys.
+	//
+	// NOTE: This applies only to OAuth credentials and does not affect per-credential request-scoped-errors under *-api-key.
+	OAuthRequestScopedErrors map[string][]RequestScopedErrorRule `yaml:"oauth-request-scoped-errors,omitempty" json:"oauth-request-scoped-errors,omitempty"`
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`

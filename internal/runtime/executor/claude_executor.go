@@ -67,11 +67,12 @@ func shouldSanitizeClaudeMessagesForUpstream(baseModel string) bool {
 	return sigcompat.SignatureProviderFromModelName(baseModel) == sigcompat.SignatureProviderClaude
 }
 
-func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body []byte, baseModel string) []byte {
+func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body []byte, baseModel string, preserveEmptyThinkingBlocks ...bool) []byte {
 	sanitized := body
-	if shouldSanitizeClaudeMessagesForUpstream(baseModel) {
+	preserveEmpty := len(preserveEmptyThinkingBlocks) > 0 && preserveEmptyThinkingBlocks[0]
+	if shouldSanitizeClaudeMessagesForUpstream(baseModel) || preserveEmpty {
 		var report sigcompat.SignatureSanitizeReport
-		sanitized, report = sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel)
+		sanitized, report = sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel, preserveEmptyThinkingBlocks...)
 		logClaudeSignatureSanitizeReport(ctx, baseModel, report)
 	}
 	return sanitizeClaudeWebSearchDomains(sanitized)
@@ -211,17 +212,19 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 		return nil
 	}
 	apiKey, _ := claudeCreds(auth)
-	if strings.TrimSpace(apiKey) == "" {
-		return nil
-	}
-	useAPIKey := auth != nil && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""
+	useAPIKey := auth != nil && (auth.AuthKind() == cliproxyauth.AuthKindAPIKey || (auth.Attributes != nil && strings.TrimSpace(auth.Attributes["api_key"]) != ""))
 	isAnthropicBase := isAnthropicUpstreamURL(req.URL)
-	if isAnthropicBase && useAPIKey {
-		req.Header.Del("Authorization")
-		req.Header.Set("x-api-key", apiKey)
+	if strings.TrimSpace(apiKey) != "" {
+		if isAnthropicBase && useAPIKey {
+			req.Header.Del("Authorization")
+			req.Header.Set("x-api-key", apiKey)
+		} else {
+			req.Header.Del("x-api-key")
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
 	} else {
+		req.Header.Del("Authorization")
 		req.Header.Del("x-api-key")
-		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	var attrs map[string]string
 	if auth != nil {

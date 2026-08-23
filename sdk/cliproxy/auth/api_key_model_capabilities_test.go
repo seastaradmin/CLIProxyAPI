@@ -5,7 +5,10 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/openai"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/tidwall/gjson"
 )
 
 func TestAttachResolvedAPIKeyModelInfoUsesSelectedCredential(t *testing.T) {
@@ -192,6 +195,55 @@ func TestAttachResolvedAPIKeyModelInfoSupportsKeylessOpenAICompatibility(t *test
 	info, ok := ResolvedAPIKeyModelInfo(req)
 	if !ok || info == nil || !info.IsCompat {
 		t.Fatal("OpenAI compatibility model IsCompat = false, want true")
+	}
+}
+
+func TestOpenAICompatibilityWithoutThinkingPreservesExplicitNone(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{OpenAICompatibility: []internalconfig.OpenAICompatibility{{
+		Name:    "transparent",
+		Prefix:  "tenant",
+		BaseURL: "https://example.com",
+		APIKeyEntries: []internalconfig.OpenAICompatibilityAPIKey{{
+			APIKey: "provider-key",
+			Models: []internalconfig.OpenAICompatibilityModel{{
+				Name:  "opaque-model",
+				Alias: "public-model",
+			}},
+		}},
+	}}})
+	auth := &Auth{
+		ID:       "auth-transparent",
+		Provider: "openai-compatibility:transparent",
+		Prefix:   "tenant",
+		Attributes: map[string]string{
+			AttributeAuthKind: AuthKindAPIKey,
+			AttributeAPIKey:   "provider-key",
+			AttributeSource:   "config:transparent[0]",
+			"compat_name":     "transparent",
+			"provider_key":    "openai-compatibility:transparent",
+		},
+	}
+	registerCapabilityTestAuth(t, manager, auth)
+	models, _, _, routing := manager.executionModelCandidatesWithAlias(auth, "tenant/public-model")
+	if len(models) != 1 || models[0] != "opaque-model" {
+		t.Fatalf("transparent execution models = %v, want [opaque-model]", models)
+	}
+	req := attachResolvedAPIKeyModelInfo(routing, cliproxyexecutor.Request{}, auth, "tenant/public-model", models[0])
+	info, ok := ResolvedAPIKeyModelInfo(req)
+	if !ok || info == nil || !info.UserDefined || info.Thinking != nil {
+		t.Fatalf("transparent model info = (%+v, %t), want user-defined without thinking capability", info, ok)
+	}
+	out, err := thinking.ApplyThinkingWithModelInfo(
+		[]byte(`{"model":"opaque-model","reasoning_effort":"none"}`),
+		[]byte(`{"model":"opaque-model","reasoning_effort":"none"}`),
+		"opaque-model", "openai", "openai", "openai", info,
+	)
+	if err != nil {
+		t.Fatalf("ApplyThinkingWithModelInfo() error = %v", err)
+	}
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "none" {
+		t.Fatalf("reasoning_effort = %q, want none; body=%s", got, out)
 	}
 }
 

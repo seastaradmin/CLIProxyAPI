@@ -187,7 +187,7 @@ func compileAPIKeyModelCapabilitiesForAuth(cfg *internalconfig.Config, auth *Aut
 			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
 		}
 		if entry := resolveOpenAICompatConfigForAuth(cfg, auth, providerKey, compatName); entry != nil {
-			compileOpenAICompatibleModelCapabilities(out, entry.Models)
+			compileOpenAICompatibleModelCapabilities(out, openAICompatAliasModels(entry, auth))
 		}
 	}
 	if len(out) == 0 {
@@ -213,9 +213,6 @@ func compileConfiguredModelCapabilities[T interface {
 func compileOpenAICompatibleModelCapabilities(out map[string][]apiKeyModelCapabilityRoute, models []internalconfig.OpenAICompatibilityModel) {
 	for i := range models {
 		support := models[i].Thinking
-		if support == nil && !models[i].Image {
-			support = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
-		}
 		addConfiguredModelCapability(out, models[i].Name, models[i].Alias, "openai-compatibility", support, models[i].IsCompat)
 	}
 }
@@ -233,6 +230,9 @@ func addConfiguredModelCapability(out map[string][]apiKeyModelCapabilityRoute, n
 		return
 	}
 	modelInfo := modelconfig.ResolveModelInfo(name, modelType, support)
+	// An OpenAI-compatible model without an explicit capability contract is opaque.
+	// Preserve request fields and let the upstream validate its native semantics.
+	modelInfo.UserDefined = modelType == "openai-compatibility" && support == nil
 	modelInfo.IsCompat = isCompat
 	route := apiKeyModelCapabilityRoute{upstreamModel: name, modelInfo: modelInfo}
 	seenKeys := make(map[string]struct{})

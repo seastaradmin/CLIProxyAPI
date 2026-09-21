@@ -611,7 +611,11 @@ func main() {
 	cpRDB := controlplane.NewRedis()
 	serverOptions := []api.ServerOption(nil)
 	if cpRDB != nil {
-		serverOptions = append(serverOptions, api.WithMiddleware(controlplane.AuthMiddleware(cpRDB)))
+		cpControlAPI := os.Getenv("CP_CONTROL_API_URL")
+		if cpControlAPI == "" {
+			cpControlAPI = "http://localhost:9002"
+		}
+		serverOptions = append(serverOptions, api.WithMiddleware(controlplane.AuthMiddleware(cpRDB, cpControlAPI)))
 		coreusage.RegisterNamedPlugin("controlplane", &controlplane.UsagePlugin{RDB: cpRDB})
 	}
 	if exampleAPIKeySafeMode {

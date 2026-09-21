@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -33,6 +34,31 @@ type UsagePlugin struct {
 	RDB *redis.Client
 }
 
+func actualUsageTokens(detail usage.Detail) int64 {
+	return usage.EnsureTokenBreakdown(detail).TotalTokens
+}
+
+func settleTPM(ctx context.Context, rdb *redis.Client, snap *Snapshot, kh string, detail usage.Detail) {
+	if rdb == nil || snap == nil || snap.TPM <= 0 || strings.TrimSpace(kh) == "" {
+		return
+	}
+	tokens := actualUsageTokens(detail)
+	if tokens <= 0 {
+		return
+	}
+	key := tpmUsageKey(kh)
+	used, err := rdb.IncrBy(ctx, key, tokens).Result()
+	if err != nil {
+		log.Printf("controlplane-usage: tpm settlement failed: %v", err)
+		return
+	}
+	if used == tokens {
+		if errExpire := rdb.Expire(ctx, key, time.Minute).Err(); errExpire != nil {
+			log.Printf("controlplane-usage: tpm settlement ttl failed: %v", errExpire)
+		}
+	}
+}
+
 // HandleUsage implements usage.Plugin.
 func (p *UsagePlugin) HandleUsage(ctx context.Context, record usage.Record) {
 	log.Printf("controlplane-usage: snap=%v model=%s alias=%s failed=%v", KeySnapshot(ctx) != nil, record.Model, record.Alias, record.Failed)
@@ -43,6 +69,11 @@ func (p *UsagePlugin) HandleUsage(ctx context.Context, record usage.Record) {
 	if snap == nil {
 		return
 	}
+	xctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// TPM is settled from the provider-reported usage after the response has
+	// completed. There is intentionally no request-time token reservation.
+	settleTPM(xctx, p.RDB, snap, keyHashFromContext(ctx), record.Detail)
 	status := "success"
 	if record.Failed {
 		status = "failed"
@@ -87,8 +118,6 @@ func (p *UsagePlugin) HandleUsage(ctx context.Context, record usage.Record) {
 	}
 	// The plugin callback runs after the request completes (the dispatch
 	// queue drains post-response), so the request ctx is already canceled.
-	xctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
 	res, err := p.RDB.XAdd(xctx, &redis.XAddArgs{
 		Stream: UsageStream,
 		Values: map[string]any{"payload": string(payload)},

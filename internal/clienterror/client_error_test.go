@@ -14,6 +14,12 @@ type statusError struct {
 	body   string
 }
 
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "timeout awaiting response headers" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
 func (e statusError) Error() string   { return e.body }
 func (e statusError) StatusCode() int { return e.status }
 
@@ -35,6 +41,11 @@ func TestHTTPStatusFromError(t *testing.T) {
 		{
 			name: "url error wraps deadline",
 			err:  &url.Error{Op: "Post", URL: "https://example.com", Err: context.DeadlineExceeded},
+			want: http.StatusGatewayTimeout,
+		},
+		{
+			name: "url error wraps network timeout",
+			err:  &url.Error{Op: "Post", URL: "https://example.com", Err: timeoutError{}},
 			want: http.StatusGatewayTimeout,
 		},
 		{

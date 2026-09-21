@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 
@@ -36,7 +37,7 @@ var requestFaultTypes = map[string]struct{}{
 
 // HTTPStatusFromError extracts an HTTP status from err.
 // Explicit StatusCode() values win. Otherwise context.Canceled maps to 499
-// and context.DeadlineExceeded maps to 504. Returns 0 when unknown.
+// and timeout errors map to 504. Returns 0 when unknown.
 func HTTPStatusFromError(err error) int {
 	if err == nil {
 		return 0
@@ -54,6 +55,10 @@ func HTTPStatusFromError(err error) int {
 		return StatusClientClosedRequest
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr != nil && netErr.Timeout() {
 		return http.StatusGatewayTimeout
 	}
 	return 0

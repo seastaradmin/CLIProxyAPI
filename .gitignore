@@ -95,3 +95,8 @@ docker-compose.override.yml
 
 # Build output
 /server
+
+# Local analysis and test artifacts
+cli-proxy-api.new
+graphify-out/
+modeltest-*.html

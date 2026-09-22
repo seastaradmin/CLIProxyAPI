@@ -381,10 +381,15 @@ func normalizeAntigravityFetchedModelID(modelID string) string {
 	return strings.ToLower(strings.TrimSpace(modelID))
 }
 
-// fetchAntigravityModelsForAuth reads the authoritative model catalog for one
-// credential. Unlike the capability-hint probe above, a successful response
-// replaces the static model list entirely (AuthoritativeList), so models that
-// upstream no longer serves stop being advertised.
+// fetchAntigravityModelsForAuth reads the model catalog for one credential. A response
+// carrying a model map is authoritative (AuthoritativeList): it replaces the static model
+// list entirely, so models that upstream no longer serves stop being advertised. A
+// response without a model map is not authoritative, but it still contributes the web
+// search capability hints parsed from the same payload, so one request serves both the
+// catalog and the capability probe.
+//
+// The request is bounded by antigravityCapabilityProbeTimeout: the caller runs off the
+// registration goroutine and a stalled upstream must never pin the probe wait group.
 func (s *Service) fetchAntigravityModelsForAuth(ctx context.Context, auth *coreauth.Auth) antigravityFetchedModels {
 	if auth == nil || auth.Metadata == nil {
 		return antigravityFetchedModels{}
@@ -394,6 +399,11 @@ func (s *Service) fetchAntigravityModelsForAuth(ctx context.Context, auth *corea
 	if accessToken == "" {
 		return antigravityFetchedModels{}
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, antigravityCapabilityProbeTimeout)
+	defer cancel()
 
 	client := &http.Client{}
 	if transport, _, errProxy := proxyutil.BuildHTTPTransport(s.antigravityModelFetchProxyURL(auth)); errProxy == nil && transport != nil {
@@ -402,7 +412,7 @@ func (s *Service) fetchAntigravityModelsForAuth(ctx context.Context, auth *corea
 
 	payload := antigravityModelsRequestPayload(auth)
 	for _, baseURL := range antigravityModelBaseURLs(auth) {
-		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+antigravityModelsPath, strings.NewReader(string(payload)))
+		req, errReq := http.NewRequestWithContext(fetchCtx, http.MethodPost, strings.TrimRight(baseURL, "/")+antigravityModelsPath, strings.NewReader(string(payload)))
 		if errReq != nil {
 			continue
 		}
@@ -453,15 +463,14 @@ func antigravityModelsRequestPayload(auth *coreauth.Auth) []byte {
 	return payload
 }
 
-// parseAntigravityFetchedModels decodes the authoritative catalog plus the web
-// search model ids from one fetchAvailableModels response. ok is false when the
-// response carries no model map, in which case the caller keeps the static list.
+// parseAntigravityFetchedModels decodes one fetchAvailableModels response into the
+// authoritative catalog (present only when the payload carries a model map) plus the web
+// search model ids reported alongside it. ok is false when the payload is not valid JSON;
+// a valid response without a model map yields hints and no catalog, which leaves the
+// baseline model list in place.
 func parseAntigravityFetchedModels(body []byte) (antigravityFetchedModels, bool) {
 	var parsed antigravityFetchAvailableModelsResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return antigravityFetchedModels{}, false
-	}
-	if parsed.Models == nil {
 		return antigravityFetchedModels{}, false
 	}
 	webSearchModels := make(map[string]struct{}, len(parsed.WebSearchModelIDs))
@@ -470,6 +479,10 @@ func parseAntigravityFetchedModels(body []byte) (antigravityFetchedModels, bool)
 		if modelID != "" {
 			webSearchModels[modelID] = struct{}{}
 		}
+	}
+	hints := antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels}
+	if parsed.Models == nil {
+		return antigravityFetchedModels{CapabilityHints: hints}, true
 	}
 
 	modelIDs := make([]string, 0, len(parsed.Models))
@@ -502,12 +515,15 @@ func parseAntigravityFetchedModels(body []byte) (antigravityFetchedModels, bool)
 
 	return antigravityFetchedModels{
 		Models:            models,
-		CapabilityHints:   antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels},
+		CapabilityHints:   hints,
 		AuthoritativeList: true,
 	}, true
 }
 
-// WaitAntigravityProbes waits for any in-flight asynchronous Antigravity capability probes to complete.
+// WaitAntigravityProbes waits for any in-flight asynchronous Antigravity probe work to
+// complete. That includes the authoritative model catalog fetch that replaces a
+// credential's baseline model list, so a caller that needs the final registration to be
+// in place must wait here.
 func (s *Service) WaitAntigravityProbes() {
 	if s == nil {
 		return
@@ -530,6 +546,17 @@ func (s *Service) waitAntigravityProbesContext(ctx context.Context) {
 	}
 }
 
+// asyncProbeAntigravityCapabilities refreshes one credential's Antigravity registration in
+// the background, off the registration path. A single upstream fetchAvailableModels
+// response is applied in one of two ways:
+//
+//   - an authoritative catalog (the payload carried a model map) replaces the baseline
+//     model list of the credential, so only models upstream still serves are advertised;
+//   - otherwise the web search capability hints parsed from the same response are applied
+//     to the models that are already registered.
+//
+// Both outcomes are dropped when the auth was re-registered, disabled or removed while the
+// probe was in flight.
 func (s *Service) asyncProbeAntigravityCapabilities(ctx context.Context, auth *coreauth.Auth, providerKey string) {
 	if auth == nil || auth.ID == "" || auth.Disabled {
 		return
@@ -552,8 +579,10 @@ func (s *Service) asyncProbeAntigravityCapabilities(ctx context.Context, auth *c
 		if s != nil {
 			defer s.antigravityProbeWg.Done()
 		}
-		hints := s.fetchAntigravityModelCapabilityHintsForAuth(probeCtx, authClone)
-		if len(hints.WebSearchModelIDs) == 0 {
+		fetched := s.fetchAntigravityModelsForAuth(probeCtx, authClone)
+		hints := fetched.CapabilityHints
+		hasCatalog := fetched.AuthoritativeList && len(fetched.Models) > 0
+		if !hasCatalog && len(hints.WebSearchModelIDs) == 0 {
 			return
 		}
 		if s == nil {
@@ -571,6 +600,11 @@ func (s *Service) asyncProbeAntigravityCapabilities(ctx context.Context, auth *c
 				return
 			}
 		}
+		if hasCatalog {
+			s.replaceAntigravityModelsWithCatalog(authClone, providerKey, expectedRegEpoch, fetched)
+			return
+		}
+
 		aliasMap := s.buildAntigravityReverseAliasMap(authClone)
 
 		// Atomically update capabilities on existing registered models if epoch matches
@@ -584,11 +618,96 @@ func (s *Service) asyncProbeAntigravityCapabilities(ctx context.Context, auth *c
 			return
 		}
 
-		if s.coreManager != nil {
-			s.coreManager.ReconcileRegistryModelStates(context.Background(), authClone.ID)
-			s.coreManager.RefreshSchedulerEntry(authClone.ID)
-		}
+		s.reconcileAntigravityProbeResult(authClone.ID)
 	}()
+}
+
+// replaceAntigravityModelsWithCatalog rebinds one credential to the authoritative model
+// catalog reported by the upstream probe, replaying the registration pipeline so the new
+// list routes exactly like the baseline registration it supersedes.
+//
+// The model registry exposes no replace operation carrying an epoch guard, so the
+// registration epoch captured when the probe started is re-checked here and RegisterClient
+// (which bumps the epoch for any later registration) performs the replacement. An epoch
+// mismatch means another registration owns the client now and this stale catalog is
+// dropped.
+func (s *Service) replaceAntigravityModelsWithCatalog(auth *coreauth.Auth, providerKey string, expectedRegEpoch uint64, fetched antigravityFetchedModels) {
+	if s == nil || auth == nil || auth.ID == "" || strings.TrimSpace(providerKey) == "" {
+		return
+	}
+	currentEpoch := GlobalModelRegistry().ClientRegistrationEpoch(auth.ID)
+	if currentEpoch == 0 || currentEpoch != expectedRegEpoch {
+		return
+	}
+	models := s.buildAntigravityCatalogRegistration(auth, providerKey, fetched)
+	if len(models) == 0 {
+		return
+	}
+	s.registerResolvedModelsForAuth(auth, providerKey, models)
+	s.reconcileAntigravityProbeResult(auth.ID)
+}
+
+// buildAntigravityCatalogRegistration turns a fetched catalog into the final model list for
+// one credential by replaying the registration pipeline (excluded models, OAuth aliases,
+// plugin models, model prefix) the baseline registration used.
+func (s *Service) buildAntigravityCatalogRegistration(auth *coreauth.Auth, providerKey string, fetched antigravityFetchedModels) []*ModelInfo {
+	if s == nil || auth == nil {
+		return nil
+	}
+	models := applyAntigravityFetchedModelCapabilities(fetched.Models, fetched.CapabilityHints)
+	if len(models) == 0 {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider == "" {
+		provider = "antigravity"
+	}
+	cfg := s.snapshotConfig()
+	models = applyExcludedModels(models, antigravityExcludedModels(cfg, auth))
+	models = applyOAuthModelAliasForAuth(cfg, provider, auth.AuthKind(), auth.Attributes, models)
+	models = s.appendPluginModels(providerKey, models)
+	return applyModelPrefixes(models, auth.Prefix, cfg != nil && cfg.ForceModelPrefix)
+}
+
+// antigravityExcludedModels resolves the excluded-model patterns that apply to one
+// Antigravity credential. The synthesizer pre-merges per-account and global exclusions into
+// the "excluded_models" attribute, so that attribute overrides the global configuration.
+func antigravityExcludedModels(cfg *config.Config, auth *coreauth.Auth) []string {
+	if auth == nil {
+		return nil
+	}
+	var excluded []string
+	if cfg != nil && !strings.EqualFold(strings.TrimSpace(auth.AuthKind()), "apikey") {
+		excluded = cfg.OAuthExcludedModels["antigravity"]
+	}
+	if auth.Attributes != nil {
+		if val, ok := auth.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
+			excluded = strings.Split(val, ",")
+		}
+	}
+	return excluded
+}
+
+// reconcileAntigravityProbeResult refreshes registry and scheduler state after a probe
+// changed the credential's model registration.
+func (s *Service) reconcileAntigravityProbeResult(authID string) {
+	if s == nil || s.coreManager == nil || authID == "" {
+		return
+	}
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), authID)
+	s.coreManager.RefreshSchedulerEntry(authID)
+}
+
+// snapshotConfig returns the current service configuration under the config mutex.
+// Asynchronous probe work must not read s.cfg directly: configuration reloads replace it
+// concurrently.
+func (s *Service) snapshotConfig() *config.Config {
+	if s == nil {
+		return nil
+	}
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
 }
 
 func (s *Service) buildAntigravityReverseAliasMap(auth *coreauth.Auth) map[string]string {

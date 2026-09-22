@@ -361,14 +361,16 @@ func (e *modelCooldownError) Headers() http.Header {
 	return headers
 }
 
-// authPriority is the selection tier for a credential. The local degradation
-// penalty is applied on top of the configured priority, so a recently failing
-// credential can be demoted below lower-priority peers; this intentionally
-// supersedes upstream's configured-priority-only tier ordering (see the
-// priority-tier assertions in the session-affinity/alias cooldown tests).
+// authPriority is the selection tier for a credential: the configured priority only.
+//
+// The local recent-failure degradation is deliberately NOT part of the tier. It used to
+// be subtracted here, which let a recently failing credential fall below a peer whose
+// configured priority is lower, contradicting upstream's configured-priority-only tier
+// ordering (upstream's session-affinity/alias cooldown tests pin that ordering). The
+// penalty is scoped to intra-tier ordering instead: see orderWithinTier, which only
+// ever reorders credentials that already share one configured priority tier.
 func authPriority(auth *Auth) int {
-	base := configuredAuthPriority(auth)
-	return base - authDegradationPenalty(auth)
+	return configuredAuthPriority(auth)
 }
 
 func configuredAuthPriority(auth *Auth) int {
@@ -386,9 +388,10 @@ func configuredAuthPriority(auth *Auth) int {
 	return parsed
 }
 
-// authDegradationPenalty temporarily lowers selection priority when a credential
-// is accumulating recent failures. Soft failures that do not fully cool down
-// the auth still lose scheduling preference until successes recover the window.
+// authDegradationPenalty scores how strongly a credential should trail its peers while it
+// is accumulating recent failures. Soft failures that do not fully cool down the auth still
+// lose scheduling preference until successes recover the window. The score is consumed as
+// intra-tier ordering only (orderWithinTier); it never changes a credential's priority tier.
 func authDegradationPenalty(auth *Auth) int {
 	if auth == nil {
 		return 0
@@ -421,6 +424,53 @@ func authDegradationPenalty(auth *Auth) int {
 		penalty = 40
 	}
 	return penalty
+}
+
+// orderWithinTier orders credentials that already share one configured priority tier so
+// that a recently failing credential trails its healthier same-tier peers, keeping ID
+// order as the tie-break. It never adds or removes a candidate, and it never moves a
+// credential between tiers, so a lower-priority peer cannot overtake a higher-priority
+// one: upstream's cross-tier ordering is untouched.
+//
+// The slice is returned unchanged (same backing array) when no candidate carries a
+// penalty, which is the common case, so upstream's ID-sorted ordering is preserved
+// exactly whenever the local degradation is inactive. Only the selector path applies this
+// ordering; the scheduler shard fast path and the plugin scheduler keep upstream's
+// tier-plus-strategy ordering unchanged.
+func orderWithinTier(auths []*Auth) []*Auth {
+	if len(auths) < 2 {
+		return auths
+	}
+	penalties := make([]int, len(auths))
+	degraded := false
+	for i, auth := range auths {
+		penalties[i] = authDegradationPenalty(auth)
+		if penalties[i] > 0 {
+			degraded = true
+		}
+	}
+	if !degraded {
+		return auths
+	}
+	type tierEntry struct {
+		auth    *Auth
+		penalty int
+	}
+	entries := make([]tierEntry, len(auths))
+	for i, auth := range auths {
+		entries[i] = tierEntry{auth: auth, penalty: penalties[i]}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].penalty != entries[j].penalty {
+			return entries[i].penalty < entries[j].penalty
+		}
+		return entries[i].auth.ID < entries[j].auth.ID
+	})
+	ordered := make([]*Auth, len(entries))
+	for i, entry := range entries {
+		ordered[i] = entry.auth
+	}
+	return ordered
 }
 
 func authWeight(auth *Auth) int64 {
@@ -592,7 +642,8 @@ func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, no
 }
 
 // availableAuthsFromPriorityBuckets flattens availability buckets into a stable, ID-sorted slice.
-// When allPriorities is false only the highest available priority tier is returned.
+// When allPriorities is false only the highest available priority tier is returned, ordered
+// intra-tier so that degraded credentials trail their healthier peers (see orderWithinTier).
 // When allPriorities is true every tier is merged, so the result carries no priority ordering:
 // use it for membership checks or feed it to highestPriorityAuths, never as a priority-ordered
 // selection order.
@@ -619,6 +670,12 @@ func availableAuthsFromPriorityBuckets(availableByPriority map[int][]*Auth, allP
 		bucket := availableByPriority[bestPriority]
 		candidates = make([]*Auth, 0, len(bucket))
 		candidates = append(candidates, bucket...)
+		if len(candidates) > 1 {
+			sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+		}
+		// Candidates share one configured priority tier here, so intra-tier degradation
+		// ordering cannot change which tier serves the request.
+		return orderWithinTier(candidates)
 	}
 	if len(candidates) > 1 {
 		sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
@@ -627,8 +684,10 @@ func availableAuthsFromPriorityBuckets(availableByPriority map[int][]*Auth, allP
 }
 
 // highestPriorityAuths narrows an availability slice to its highest priority tier while
-// preserving the input order. The input slice is returned unchanged when every candidate
-// already shares the highest priority, so the common single-tier case allocates nothing.
+// preserving the input order, except that degraded members of that tier trail their
+// healthier peers (see orderWithinTier). The input slice is returned unchanged when every
+// candidate already shares the highest priority and none is degraded, so the common
+// single-tier case allocates nothing.
 func highestPriorityAuths(auths []*Auth) []*Auth {
 	if len(auths) <= 1 {
 		return auths
@@ -646,7 +705,7 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 		}
 	}
 	if bestCount == len(auths) {
-		return auths
+		return orderWithinTier(auths)
 	}
 	highest := make([]*Auth, 0, bestCount)
 	for _, auth := range auths {
@@ -654,7 +713,7 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 			highest = append(highest, auth)
 		}
 	}
-	return highest
+	return orderWithinTier(highest)
 }
 
 // preferProtocolPassthrough filters available auths to those that natively support
@@ -744,18 +803,24 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 }
 
 // successorIndex returns the index of the first candidate ordered after lastID, wrapping to
-// the start of the ring. Candidates arrive sorted by ID, so this resumes the rotation at the
-// credential that follows the previous pick even when candidates were filtered out in
-// between. An empty lastID starts at the head.
+// the start of the ring. Candidates normally arrive sorted by ID, so this resumes the
+// rotation at the credential that follows the previous pick even when candidates were
+// filtered out in between. An empty lastID starts at the head.
+//
+// A linear scan replaces the binary search because intra-tier degradation ordering
+// (orderWithinTier) can move a degraded credential behind its peers, which would make the
+// ID key non-monotonic; over an ID-sorted slice the scan returns the same index the binary
+// search did.
 func successorIndex(available []*Auth, lastID string) int {
 	if lastID == "" {
 		return 0
 	}
-	index := sort.Search(len(available), func(i int) bool { return available[i].ID > lastID })
-	if index >= len(available) {
-		return 0
+	for i, auth := range available {
+		if auth != nil && auth.ID > lastID {
+			return i
+		}
 	}
-	return index
+	return 0
 }
 
 // ensureRotationKey ensures the rotation map has capacity for the given key.

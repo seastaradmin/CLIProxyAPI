@@ -111,13 +111,11 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = registry.GetAIStudioModels()
 		models = applyExcludedModels(models, excluded)
 	case "antigravity":
-		staticModels := registry.GetAntigravityModels()
-		fetched := s.fetchAntigravityModelsForAuth(ctx, a)
-		if fetched.AuthoritativeList {
-			models = applyAntigravityFetchedModelCapabilities(fetched.Models, fetched.CapabilityHints)
-		} else {
-			models = staticModels
-		}
+		// Registration must not block on the upstream model catalog: bind the baseline list
+		// here and let the asynchronous Antigravity probe (started from the shared tail
+		// below, see asyncProbeAntigravityCapabilities) replace it once the authoritative
+		// catalog for this credential has been fetched.
+		models = registry.GetAntigravityModels()
 		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()

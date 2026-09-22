@@ -875,7 +875,17 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamWithAuthManager_ReportsBootstrapRetryModelCooldown(t *testing.T) {
+// TestExecuteStreamWithAuthManager_ReportsBootstrapRetryAuthUnavailable covers the
+// bootstrap retry after a terminal unauthorized stream error from the only credential.
+//
+// Upstream records the 401 as a model-level cooldown AND marks the credential itself
+// terminally unauthorized (no refresh scheduled). On the retry, selection reports the
+// terminal credential failure instead of the cooldown, so the client sees 503
+// auth_unavailable carrying the last upstream error, not 429 model_cooldown. Verified
+// against a clean origin/main checkout (v7.3.11): upstream returns exactly this 503, so
+// the earlier local expectation of 429 model_cooldown no longer describes the merge
+// behaviour and this test now pins upstream's precedence.
+func TestExecuteStreamWithAuthManager_ReportsBootstrapRetryAuthUnavailable(t *testing.T) {
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
@@ -922,18 +932,33 @@ func TestExecuteStreamWithAuthManager_ReportsBootstrapRetryModelCooldown(t *test
 	if gotErr == nil {
 		t.Fatalf("expected terminal error")
 	}
-	if gotErr.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusTooManyRequests)
+	if gotErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusServiceUnavailable)
 	}
 	if gotErr.Error == nil {
-		t.Fatalf("expected model cooldown error")
+		t.Fatalf("expected auth_unavailable error")
 	}
 	errorText := gotErr.Error.Error()
-	if !strings.Contains(errorText, `"code":"model_cooldown"`) {
-		t.Fatalf("error missing model_cooldown code: %q", errorText)
+	if !strings.Contains(errorText, "auth_unavailable") {
+		t.Fatalf("error missing auth_unavailable code: %q", errorText)
 	}
-	if !strings.Contains(errorText, `"model":"test-model"`) {
-		t.Fatalf("error missing model context: %q", errorText)
+	if !strings.Contains(errorText, "unauthorized") {
+		t.Fatalf("error missing the terminal upstream cause: %q", errorText)
+	}
+
+	// The 401 still records a model-level cooldown, so a later request against the same
+	// credential sees a cooling model; the terminal credential error is what the client
+	// gets first because selection can no longer pick this credential at all.
+	updated, ok := manager.GetByID(auth1.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to remain registered")
+	}
+	state := updated.ModelStates["test-model"]
+	if state == nil || state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected the 401 to record a model cooldown, got %#v", state)
+	}
+	if !updated.Unavailable {
+		t.Fatal("expected the credential to be marked unavailable after a terminal 401")
 	}
 
 	if executor.Calls() != 1 {

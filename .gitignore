@@ -80,7 +80,12 @@ CPA-Manager-Plus/
 
 # Runtime state and deployment artifacts
 availability-state.json
+supabase-usage-outbox.json
 *.plist
+# Ad-hoc logs from manually launched instances
+cpa.log
+run.log
+cli-proxy-api.nohup.log
 
 # Screenshots
 availability-page-*.png

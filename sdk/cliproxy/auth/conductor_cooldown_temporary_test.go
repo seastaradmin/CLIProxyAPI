@@ -10,10 +10,18 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-// TestTemporary403CooldownRecoversAfterExpiry verifies that a single 403 failure
-// puts the model into a temporary cooldown that automatically recovers once the
-// cooldown expires, and that the model is NOT permanently suspended in the registry.
-func TestTemporary403CooldownRecoversAfterExpiry(t *testing.T) {
+// TestTemporary403CooldownSuspendsModelThenRecovers verifies the cooldown contract for a
+// single 403 failure under upstream's model-projection rules: the model enters a temporary
+// model-level cooldown, the registry reports that cooling model as suspended for its client
+// (upstream's ApplyClientModelProjections deliberately hides any model with a live cooldown,
+// so the model count drops to 0 while the cooldown lasts), and both the cooldown and the
+// suspension clear once the cooldown expires.
+//
+// This intentionally asserts upstream's behaviour. The earlier local expectation was that a
+// temporary 403 leaves the model counted in the registry; upstream now projects live model
+// cooldowns as suspended, and that projection wins. The suspension is therefore a temporary
+// follow-the-cooldown state, not a permanent registry removal.
+func TestTemporary403CooldownSuspendsModelThenRecovers(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
@@ -58,27 +66,38 @@ func TestTemporary403CooldownRecoversAfterExpiry(t *testing.T) {
 		t.Fatal("expected NextRetryAfter to be set")
 	}
 
-	// The model must NOT be permanently suspended in the registry.
-	// GetModelCount should still reflect the registered client (count=1),
-	// not 0 which would indicate a registry-level suspension.
-	if count := reg.GetModelCount(model); count != 1 {
-		t.Fatalf("GetModelCount = %d, want 1 (temporary 403 must not permanently suspend model)", count)
+	// While the cooldown is live, upstream's projection reports the model as suspended for
+	// this client, so it is not counted as an available provider of the model.
+	if !reg.IsModelSuspendedForClient(auth.ID, model) {
+		t.Fatal("expected the cooling model to be projected as suspended for its client")
+	}
+	if count := reg.GetModelCount(model); count != 0 {
+		t.Fatalf("GetModelCount = %d, want 0 while the model cooldown is live", count)
 	}
 
-	// Simulate cooldown expiry by backdating NextRetryAfter and clearing the unavailable flag.
+	// Expire the cooldown without clearing the state: reconciliation must treat the elapsed
+	// NextRetryAfter as recovered and re-project the model as available.
 	m.mu.Lock()
 	if a, ok := m.auths[auth.ID]; ok && a != nil {
 		if s, ok := a.ModelStates[model]; ok && s != nil {
 			s.NextRetryAfter = time.Now().Add(-1 * time.Second)
-			s.Unavailable = false
 		}
 	}
 	m.mu.Unlock()
-	if m.scheduler != nil {
-		m.scheduler.upsertAuth(func() *Auth {
-			a, _ := m.GetByID(auth.ID)
-			return a
-		}())
+	m.ReconcileRegistryModelStates(context.Background(), auth.ID)
+
+	if reg.IsModelSuspendedForClient(auth.ID, model) {
+		t.Fatal("expected the suspension to clear once the cooldown expired")
+	}
+	if count := reg.GetModelCount(model); count != 1 {
+		t.Fatalf("GetModelCount = %d, want 1 after the cooldown expired", count)
+	}
+	recovered, ok := m.GetByID(auth.ID)
+	if !ok || recovered == nil {
+		t.Fatal("expected auth to remain registered after recovery")
+	}
+	if recoveredState := recovered.ModelStates[model]; recoveredState != nil && recoveredState.Unavailable {
+		t.Fatalf("expected the model cooldown to be cleared, got %#v", recoveredState)
 	}
 
 	// Clear the execute error so the next call succeeds.

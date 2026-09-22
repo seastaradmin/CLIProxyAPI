@@ -875,7 +875,17 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamWithAuthManager_ReportsBootstrapRetryModelCooldown(t *testing.T) {
+// TestExecuteStreamWithAuthManager_ReportsBootstrapRetryAuthUnavailable covers the
+// bootstrap retry after a terminal unauthorized stream error from the only credential.
+//
+// Upstream records the 401 as a model-level cooldown AND marks the credential itself
+// terminally unauthorized (no refresh scheduled). On the retry, selection reports the
+// terminal credential failure instead of the cooldown, so the client sees 503
+// auth_unavailable carrying the last upstream error, not 429 model_cooldown. Verified
+// against a clean origin/main checkout (v7.3.11): upstream returns exactly this 503, so
+// the earlier local expectation of 429 model_cooldown no longer describes the merge
+// behaviour and this test now pins upstream's precedence.
+func TestExecuteStreamWithAuthManager_ReportsBootstrapRetryAuthUnavailable(t *testing.T) {
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
@@ -922,22 +932,136 @@ func TestExecuteStreamWithAuthManager_ReportsBootstrapRetryModelCooldown(t *test
 	if gotErr == nil {
 		t.Fatalf("expected terminal error")
 	}
-	if gotErr.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusTooManyRequests)
+	if gotErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusServiceUnavailable)
 	}
 	if gotErr.Error == nil {
-		t.Fatalf("expected model cooldown error")
+		t.Fatalf("expected auth_unavailable error")
 	}
 	errorText := gotErr.Error.Error()
-	if !strings.Contains(errorText, `"code":"model_cooldown"`) {
-		t.Fatalf("error missing model_cooldown code: %q", errorText)
+	if !strings.Contains(errorText, "auth_unavailable") {
+		t.Fatalf("error missing auth_unavailable code: %q", errorText)
 	}
-	if !strings.Contains(errorText, `"model":"test-model"`) {
-		t.Fatalf("error missing model context: %q", errorText)
+	if !strings.Contains(errorText, "unauthorized") {
+		t.Fatalf("error missing the terminal upstream cause: %q", errorText)
+	}
+
+	// The 401 still records a model-level cooldown, so a later request against the same
+	// credential sees a cooling model; the terminal credential error is what the client
+	// gets first because selection can no longer pick this credential at all.
+	updated, ok := manager.GetByID(auth1.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to remain registered")
+	}
+	state := updated.ModelStates["test-model"]
+	if state == nil || state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected the 401 to record a model cooldown, got %#v", state)
+	}
+	if !updated.Unavailable {
+		t.Fatal("expected the credential to be marked unavailable after a terminal 401")
 	}
 
 	if executor.Calls() != 1 {
 		t.Fatalf("expected exactly one upstream call before retry path selection failure, got %d", executor.Calls())
+	}
+}
+
+type overloadStreamExecutor struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *overloadStreamExecutor) Identifier() string { return "codex" }
+
+func (e *overloadStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *overloadStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+
+	return nil, &coreauth.Error{
+		Code:       "server_is_overloaded",
+		Message:    `{"type":"error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","sequence_number":0}`,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+}
+
+func (e *overloadStreamExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *overloadStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *overloadStreamExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "HttpRequest not implemented"}
+}
+
+func TestExecuteStreamWithAuthManager_ForwardsOverloadErrorWhenAllAuthsOverloaded(t *testing.T) {
+	executor := &overloadStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{
+		ID:       "auth-overload-1",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "test1@example.com"},
+	}
+	auth2 := &coreauth.Auth{
+		ID:       "auth-overload-2",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "test2@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), auth2); err != nil {
+		t.Fatalf("manager.Register(auth2): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "gpt-5.6-sol"}})
+	registry.GetGlobalRegistry().RegisterClient(auth2.ID, auth2.Provider, []*registry.ModelInfo{{ID: "gpt-5.6-sol"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+		registry.GetGlobalRegistry().UnregisterClient(auth2.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+
+	// First request tries all accounts, fails with overload, cooling both credentials down.
+	_, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "gpt-5.6-sol", []byte(`{"model":"gpt-5.6-sol"}`), "")
+	var gotErr *interfaces.ErrorMessage
+	for msg := range errChan {
+		if msg != nil {
+			gotErr = msg
+		}
+	}
+	if gotErr == nil {
+		t.Fatalf("expected terminal error")
+	}
+	if !strings.Contains(gotErr.Error.Error(), "Our servers are currently overloaded. Please try again later.") && !strings.Contains(gotErr.Error.Error(), "server_is_overloaded") {
+		t.Fatalf("expected error message to contain overload details, got: %q", gotErr.Error.Error())
+	}
+
+	// Subsequent request (e.g. client reconnect) while credentials are in cooldown should still report the upstream error reason.
+	_, _, errChan2 := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "gpt-5.6-sol", []byte(`{"model":"gpt-5.6-sol"}`), "")
+	var gotErr2 *interfaces.ErrorMessage
+	for msg := range errChan2 {
+		if msg != nil {
+			gotErr2 = msg
+		}
+	}
+	if gotErr2 == nil {
+		t.Fatalf("expected terminal error on reconnect request")
+	}
+	if !strings.Contains(gotErr2.Error.Error(), "Our servers are currently overloaded. Please try again later.") && !strings.Contains(gotErr2.Error.Error(), "server_is_overloaded") {
+		t.Fatalf("expected reconnect error message to contain overload details, got: %q", gotErr2.Error.Error())
 	}
 }
 

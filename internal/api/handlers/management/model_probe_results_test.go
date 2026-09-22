@@ -89,7 +89,11 @@ func TestListModelProbeResultsReturnsPersistedEvidence(t *testing.T) {
 	authDir := t.TempDir()
 	handler := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
 	auth := &coreauth.Auth{ID: "auth-a", Index: "index-a", Provider: "gemini"}
-	checkedAt := time.Date(2026, 7, 25, 3, 0, 0, 0, time.UTC)
+	// This test goes through the HTTP handler, which loads with time.Now() and
+	// drops evidence older than the 30-day retention. A fixed calendar date here
+	// silently starts failing once that date falls outside the window, so anchor
+	// the fixture to now instead.
+	checkedAt := time.Now().UTC().Truncate(time.Second)
 	if errPersist := handler.persistModelProbeResults(context.Background(), auth, "gemini-pro", checkedAt, []authFileHealthProtocolResult{
 		{Protocol: "chat", Status: "success", StatusCode: http.StatusOK, LatencyMS: 321},
 	}); errPersist != nil {

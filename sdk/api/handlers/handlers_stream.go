@@ -930,6 +930,13 @@ func isStreamContentPayload(protocol string, payload []byte) bool {
 			gjson.GetBytes(payload, "choices.0.delta.reasoning_content").String() != ""
 	case "openai-response":
 		switch gjson.GetBytes(payload, "type").String() {
+		case "response.created":
+			// The Responses API announces the response with response.created: the
+			// client has already been told which response id it is watching, so a
+			// later terminal failure must be surfaced as an SSE error frame rather
+			// than retried behind the client's back. Buffering it here would make
+			// the handler report a pre-stream JSON error for a truncated stream.
+			return true
 		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.completed", "response.done":
 			return true
 		}

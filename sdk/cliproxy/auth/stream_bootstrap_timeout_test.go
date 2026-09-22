@@ -194,7 +194,7 @@ func TestIsStreamContentPayload(t *testing.T) {
 		{name: "openai reasoning delta", format: sdktranslator.FormatOpenAI, payload: `data: {"choices":[{"delta":{"reasoning_content":"think"}}]}`, want: true},
 		{name: "openai usage chunk", format: sdktranslator.FormatOpenAI, payload: `data: {"choices":[],"usage":{"total_tokens":1}}`, want: false},
 		{name: "openai done marker", format: sdktranslator.FormatOpenAI, payload: "data: [DONE]\n", want: true},
-		{name: "responses created", format: sdktranslator.FormatOpenAIResponse, payload: `data: {"type":"response.created"}`, want: false},
+		{name: "responses created", format: sdktranslator.FormatOpenAIResponse, payload: `data: {"type":"response.created"}`, want: true},
 		{name: "responses text delta", format: sdktranslator.FormatOpenAIResponse, payload: `data: {"type":"response.output_text.delta","delta":"hi"}`, want: true},
 		{name: "responses reasoning delta", format: sdktranslator.FormatOpenAIResponse, payload: `data: {"type":"response.reasoning_summary_text.delta","delta":"think"}`, want: true},
 		{name: "responses completed", format: sdktranslator.FormatOpenAIResponse, payload: `data: {"type":"response.completed"}`, want: true},

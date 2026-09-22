@@ -221,6 +221,14 @@ func isStreamContentPayload(format sdktranslator.Format, payload []byte) bool {
 			gjson.GetBytes(payload, "choices.0.delta.reasoning_content").String() != ""
 	case sdktranslator.FormatOpenAIResponse:
 		switch gjson.GetBytes(payload, "type").String() {
+		case "response.created":
+			// The Responses API announces the response with response.created: the
+			// client has already been told which response id it is watching, so a
+			// later terminal failure must be surfaced rather than retried on
+			// another credential (which would present the client with a second,
+			// unrelated response). Upstream commits on the first payload for the
+			// same reason.
+			return true
 		case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.completed", "response.done":
 			return true
 		}

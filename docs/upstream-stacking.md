@@ -98,8 +98,8 @@ git merge origin/main
 ## v7.3.11 merge report
 
 Merged `origin/main` (`ffe6ad3c`, v7.3.11, 2026-09-21) into `enterprise-base`
-(`ae6a978d`, based on v7.2.140). Scratch branch `merge/v7.3.11`, commit
-`4bb8252d`. **WIP — not for deployment.**
+(`ae6a978d`, based on v7.2.140), and landed the result on `enterprise-base` at
+`f0b9e28b`. The scratch branch `merge/v7.3.11` keeps the same work.
 
 ### Scale
 
@@ -110,87 +110,90 @@ Merged `origin/main` (`ffe6ad3c`, v7.3.11, 2026-09-21) into `enterprise-base`
 
 ### Test result
 
-`go build ./...` passes. 93 of 105 test packages pass; 6 packages fail.
+`go build ./...` passes and **all 99 test packages pass** — the same result as a
+clean upstream checkout.
 
-Seven tests fail in total. One is pre-existing on `enterprise-base` and
-unrelated (`TestListModelProbeResultsReturnsPersistedEvidence`). The other six
-are semantic clashes between the local features and upstream's new models — each
-needs a design decision, not a conflict resolution. All six were confirmed to
-pass against a clean `origin/main` checkout, so they are not upstream bugs.
+Resolving the conflicts mechanically gets a build but not correct behaviour: it
+left seven failing tests. Six were semantic clashes where the local features and
+upstream's new cooldown/stream model genuinely disagreed; the seventh was a
+pre-existing time-dependent bug on `enterprise-base`. All seven are now fixed.
+Details below, because the same three clashes will resurface at the next
+upstream bump.
 
-### Open item 1 — antigravity registration blocks on the model fetch
+### Resolution 1 — antigravity registration is now asynchronous
 
-*Failing:* `TestAntigravityModelRegistration_AsyncNonBlocking`
+`registerModelsForAuth` no longer calls `fetchAntigravityModelsForAuth`
+synchronously. It returns the static list like upstream, and the catalog fetch
+runs on `antigravityProbeWg` inside `asyncProbeAntigravityCapabilities`, which
+applies the catalog through an epoch-guarded replace and falls back to upstream's
+capability-hint mutation when the response carries no model map.
+`WaitAntigravityProbes()` still waits for it, so the local catalog test passes
+unmodified. This also removed a deadlock: the synchronous fetch blocked the test
+goroutine before the probe mocks could be released, which hung
+`TestAntigravityAsyncProbe_DiscardsStaleProbeWhenAuthReRegistered` until the
+10-minute panic.
 
-Upstream requires `registerModelsForAuth` to return in under 500 ms and does its
-capability probing asynchronously (`asyncProbeAntigravityCapabilities`). The
-local authoritative-catalog fetch (`fetchAntigravityModelsForAuth`, called from
-`sdk/cliproxy/service_models.go`) runs synchronously inside registration, so
-registration blocks on a network round trip — 10 s in the test.
+Two things to know about the result:
 
-*Decision needed:* move the local catalog fetch behind the same asynchronous
-probe machinery upstream uses, so registration stays non-blocking and the
-fetched catalog is applied to the registry when it arrives. This is the
-recommended direction; it is also the larger change, because the local feature
-replaces the client's whole model list rather than mutating capabilities in
-place.
+- The endpoint-level capability-hints cache (`fetchAntigravityModelCapabilityHintsForAuth`,
+  5-minute TTL, singleflight, auth-failure backoff) is no longer on the
+  registration path — hints now come from the same per-credential catalog
+  response. The helper and its tests are intact. An authoritative catalog is
+  per-credential while that cache is keyed by base URL and proxy, so serving
+  catalogs from it would leak one account's catalog to another. To restore
+  upstream's dedup, wrap the catalog fetch in the existing
+  `antigravityCapabilityGroup` with a per-(auth, endpoint) key.
+- An authoritative-but-empty catalog (`"models": {}`) is treated as a no-op
+  rather than an unregister, so a malformed-looking response cannot wipe a
+  registration.
 
-### Open item 2 — stream bootstrap commit rule (F6 vs upstream)
+### Resolution 2 — `response.created` commits the stream
 
-*Failing:* `TestCodexModelLevelCoolingPreservesSiblingModel`,
-`TestCodexTerminalQuotaCoolsAccountAcrossModels`,
-`TestCodexIncompleteStreamIsNotTypedAsInvalidRequest`
+Both copies of the content-window rule (`sdk/cliproxy/auth/conductor_stream.go`
+and `sdk/api/handlers/handlers_stream.go`) treated `response.created` as protocol
+metadata and kept buffering. A Codex stream that announced its response and then
+failed therefore looked uncommitted: the manager retried on another credential
+(the log showed two upstream attempts where upstream makes one) and the handler
+reported a pre-stream JSON error for a truncated stream, typed
+`invalid_request_error` — a type that tells every downstream client not to retry.
 
-Upstream commits the stream bootstrap as soon as **any** payload arrives. The
-local `readStreamBootstrapWithTimeoutFor` keeps buffering payloads that are only
-protocol metadata and commits on the first **client-visible** payload
-(`isStreamContentPayload`).
+`response.created` now counts as client-visible content for `openai-response` in
+both places, which matches upstream's effective behaviour (upstream commits on
+the first payload) while keeping the content window for the metadata-only cases
+the local rule was written for. Note there are **two** copies of this rule — a
+future change must touch both.
 
-Consequence, verified on `TestCodexModelLevelCoolingPreservesSiblingModel`: a
-Codex stream sends `response.created` and then a terminal `usage_limit_reached`.
-Under the local rule the stream still counts as uncommitted, so the error becomes
-a retryable bootstrap failure and the manager rotates to another credential — the
-upstream log shows two upstream attempts (`quota-high` then `quota-low`) where
-upstream makes one. The client sees a successful response instead of the quota
-error. `response.created` is not in the local content set for
-`FormatOpenAIResponse`; `response.completed` is.
+### Resolution 3 — the cooling model follows upstream
 
-Two upstream tests and the local `stream_bootstrap_timeout_test.go` lock the two
-rules against each other.
+- `authPriority` returns the configured priority only, so the local
+  `authDegradationPenalty` can no longer move a credential between tiers, which
+  is what upstream's session-affinity test requires. The penalty is re-scoped to
+  intra-tier ordering (`orderWithinTier`) in the selector path. Caveat: the
+  penalty does not apply on `scheduler.go`'s shard fast path, which keeps
+  upstream's ordering and its O(1) selection.
+- Two local tests asserted behaviour upstream deliberately changed and were
+  updated to upstream's semantics rather than papering over the merge:
+  `TestTemporary403CooldownSuspendsModelThenRecovers` now asserts upstream's
+  projection (model suspended while the cooldown is live, recovered after
+  reconciliation), and `TestExecuteStreamWithAuthManager_ReportsBootstrapRetryAuthUnavailable`
+  now asserts `auth_unavailable`/503. The latter was confirmed against a clean
+  `origin/main` checkout to be upstream's behaviour rather than a resolution
+  error, which is exactly the check to repeat for any local test that fails only
+  after a merge.
 
-*Decision needed:* whether a Responses-API stream should commit on
-`response.created`. Either widen the local content set to include it (matches
-upstream; narrows the retry window for Codex streams), or keep the local rule and
-make the caller surface terminal errors instead of rotating (keeps the wider
-retry window; needs a caller change upstream does not have).
+### Pre-existing bug fixed along the way
 
-### Open item 3 — credential scope of quota errors (F7 vs upstream)
-
-*Failing:* `TestExecuteStreamWithAuthManager_ReportsBootstrapRetryModelCooldown`
-(local), `TestTemporary403CooldownRecoversAfterExpiry` (local),
-`TestManagerSessionAffinityAliasCooldownPreservesSelection` (upstream)
-
-Three disagreements in the cooldown model. The first two were root-caused; the
-third is reported from the resolver's analysis and not independently reproduced:
-
-- Upstream's new `ApplyClientModelProjections` projects any live model cooldown as
-  `Suspended`, so `registry.GetModelCount` returns 0 immediately after a 403
-  cooldown. The local 403-recovery test expects the model to stay registered until
-  the cooldown expires. Confirmed by disabling the projection call in a scratch
-  copy, after which the test passes.
-- The local `authDegradationPenalty` (2 recent failures → priority −5) demotes a
-  credential below a lower-priority peer, which breaks upstream's session-affinity
-  test.
-- The local quota classification returns 503 where an upstream test expects 429.
-
-*Decision needed:* whether the degradation penalty participates in cross-tier
-ordering or only within a tier, and whether model-level cooling should suppress
-the local credential-scoped quota propagation.
+`TestListModelProbeResultsReturnsPersistedEvidence` was failing on
+`enterprise-base` before this merge. It goes through the HTTP handler, which
+loads probe results with `time.Now()` and drops evidence older than the 30-day
+retention window, but its fixture used a fixed 2026-07-25 timestamp — so it
+started failing by itself about a month after it was written. The fixture is now
+anchored to now.
 
 ### Verification still outstanding
 
-The merge has not been exercised end to end. Before it can be deployed it needs
-the three layers:
+The merge is green at unit and integration level but has not been exercised end
+to end. Before deployment it needs the three layers:
 
 - **API** — the management endpoints (`/v0/management/user-side-availability`,
   `/trend`, `/requests`, `/opencode/usage`) and the control-plane enforcement
@@ -199,3 +202,4 @@ the three layers:
   trend chart's window selector, and the auth-file cooldown display.
 - **DB** — the control-plane counters (`auth:<sha256>`, `cp:budget:key:<id>:<YYYY-MM>`,
   `cp:tpm:usage:<keyHash>`, `cp:rpm:<keyHash>`) and the request journal on disk.
+

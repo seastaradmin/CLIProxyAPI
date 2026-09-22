@@ -101,6 +101,15 @@ Merged `origin/main` (`ffe6ad3c`, v7.3.11, 2026-09-21) into `enterprise-base`
 (`ae6a978d`, based on v7.2.140), and landed the result on `enterprise-base` at
 `f0b9e28b`. The scratch branch `merge/v7.3.11` keeps the same work.
 
+**Follow-up: v7.3.12 merged the same day, 0 conflicts.** 15 upstream commits
+(`ffe6ad3c..55566294`, mostly executor perf work, a `grok-4.7` model definition
+and a Responses tool index), landed at `7ff46cca`, green on the first test run.
+`enterprise-base` is now 0 behind / 31 ahead of `origin/main`.
+
+That contrast is the point of this document: the cost of a bump tracks how long
+you waited, not how much upstream shipped. A month of drift cost 39 conflict
+hunks; a few hours cost none.
+
 ### Scale
 
 - 478 upstream commits, 773 files, +166k lines.

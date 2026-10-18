@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 )
 
 // Result holds the outcome of probing one protocol on one provider.
@@ -27,10 +29,11 @@ type Result struct {
 
 // ProviderTarget describes a provider to probe.
 type ProviderTarget struct {
-	Name    string
-	BaseURL string
-	APIKey  string
-	Model   string // test model to use
+	ClientProfile string
+	Name          string
+	BaseURL       string
+	APIKey        string
+	Model         string // test model to use
 }
 
 // AllProtocols are the protocols probed by default.
@@ -49,7 +52,7 @@ func ProbeProviderProtocols(ctx context.Context, target ProviderTarget, protocol
 	if target.BaseURL == "" || target.Model == "" {
 		return nil
 	}
-	client := &http.Client{Timeout: probeTimeout}
+	client := helps.WithClientProfile(&http.Client{Timeout: probeTimeout}, target.ClientProfile)
 	results := make(map[string]Result, len(protocols))
 	var mu sync.Mutex
 	var wg sync.WaitGroup

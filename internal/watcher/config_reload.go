@@ -176,10 +176,11 @@ func (w *Watcher) triggerAutoProbe(oldCfg, newCfg *config.Config) {
 			apiKey = strings.TrimSpace(compat.APIKeyEntries[0].APIKey)
 		}
 		targets = append(targets, probe.ProviderTarget{
-			Name:    compat.Name,
-			BaseURL: compat.BaseURL,
-			APIKey:  apiKey,
-			Model:   model,
+			ClientProfile: compat.ClientProfile,
+			Name:          compat.Name,
+			BaseURL:       compat.BaseURL,
+			APIKey:        apiKey,
+			Model:         model,
 		})
 	}
 	if len(targets) == 0 {

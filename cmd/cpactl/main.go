@@ -144,8 +144,8 @@ func cmdAuth(args []string) {
 		name := args[1]
 		model := args[2]
 		payload := map[string]any{
-			"name":  name,
-			"model": model,
+			"name":      name,
+			"model":     model,
 			"protocols": []string{"responses", "chat", "messages"},
 		}
 		data := apiPost("/auth-files/health-check", payload)

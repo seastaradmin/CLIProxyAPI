@@ -11,15 +11,17 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 type protocolProbeRequest struct {
-	BaseURL   string   `json:"base_url"`
-	APIKey    string   `json:"api_key"`
-	Model     string   `json:"model"`
-	Protocols []string `json:"protocols"`
-	TimeoutMS int      `json:"timeout_ms"`
+	ClientProfile string   `json:"client-profile"`
+	BaseURL       string   `json:"base_url"`
+	APIKey        string   `json:"api_key"`
+	Model         string   `json:"model"`
+	Protocols     []string `json:"protocols"`
+	TimeoutMS     int      `json:"timeout_ms"`
 }
 
 type protocolProbeResult struct {
@@ -63,7 +65,7 @@ func (h *Handler) ProbeUpstreamProtocols(c *gin.Context) {
 		want = []string{"chat", "responses", "messages"}
 	}
 
-	client := &http.Client{Timeout: timeout}
+	client := helps.WithClientProfile(&http.Client{Timeout: timeout}, req.ClientProfile)
 	results := make([]protocolProbeResult, 0, len(want))
 	for _, proto := range want {
 		results = append(results, probeOneProtocol(c.Request.Context(), client, base, apiKey, model, proto))

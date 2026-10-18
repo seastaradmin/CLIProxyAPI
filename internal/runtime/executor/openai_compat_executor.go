@@ -450,6 +450,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		authType, authValue = auth.AccountInfo()
 	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	if compat := e.resolveCompatConfig(auth); compat != nil {
+		httpClient = helps.WithClientProfile(httpClient, compat.ClientProfile)
+	}
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	sendOnce := func(endpointPath string) (*http.Response, error) {
 		urlOnce := strings.TrimSuffix(baseURL, "/") + endpointPath
@@ -691,6 +694,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		authType, authValue = auth.AccountInfo()
 	}
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	if compat := e.resolveCompatConfig(auth); compat != nil {
+		httpClient = helps.WithClientProfile(httpClient, compat.ClientProfile)
+		if strings.EqualFold(strings.TrimSpace(compat.ClientProfile), "opencode") {
+			translated = helps.SetBoolIfDifferent(translated, "stream", true)
+		}
+	}
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	sendOnce := func(endpointPath string, requestBody []byte) (*http.Response, error) {
 		urlOnce := strings.TrimSuffix(baseURL, "/") + endpointPath

@@ -254,3 +254,27 @@ func TestProtocolSlicesEqual(t *testing.T) {
 		}
 	}
 }
+
+func TestProtocolProbeBatchOpenCodeProfile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if body["stream"] != true || body["tool_choice"] != "none" {
+			t.Errorf("probe did not apply profile: %v", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"probe\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+	h := &Handler{cfg: &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{Name: "profile", BaseURL: upstream.URL, ClientProfile: "opencode", Models: []config.OpenAICompatibilityModel{{Name: "m"}}}}}}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"provider_name":"profile","protocols":["chat"]}`))
+	h.ProtocolProbeBatch(c)
+	if w.Code != 200 || !bytes.Contains(w.Body.Bytes(), []byte(`"chat":"success"`)) {
+		t.Fatalf("probe failed: %d %s", w.Code, w.Body.String())
+	}
+}

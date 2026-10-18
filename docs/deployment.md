@@ -3,8 +3,9 @@
 ## Topology
 
 The service runs **from this repository directory**. There is no separate deploy
-directory any more: `/Users/ping/cli-proxy-api/` is kept only as a rollback path
-(see below) and is no longer the target of anything.
+directory any more. The old `/Users/ping/cli-proxy-api/` directory was removed
+on 2026-09-22 after verifying the active process and launchd configuration use
+this repository. Its final configuration was saved in the rollback backup below.
 
 | | |
 |---|---|
@@ -86,18 +87,13 @@ Everything from the 2026-09-22 migration is in
 - `availability-state.json.repo-before-migration`,
   `management.html.repo-before-migration`
 
-To go back to serving from `/Users/ping/cli-proxy-api/`:
+The old deployment directory was deleted on 2026-09-22. Its final configuration
+is preserved as `config.yaml.old-deploy-before-removal` in this backup directory.
+The current repository configuration has subsequent changes and was not replaced.
 
-```bash
-launchctl bootout gui/$(id -u)/com.routerforme.cli-proxy-api
-cp ~/.cli-proxy-api/rollback-20260922/com.routerforme.cli-proxy-api.plist.bak \
-   ~/Library/LaunchAgents/com.routerforme.cli-proxy-api.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.routerforme.cli-proxy-api.plist
-```
-
-That directory still holds its own binary, config and state, so it is a
-complete rollback target. Do not delete it until the new layout has been stable
-for a while.
+The backed-up plist points at the deleted directory and cannot be restored as a
+working rollback by itself. Any rollback now requires restoring a compatible
+binary and configuration and checking the launchd paths before restarting.
 
 ## History worth knowing
 

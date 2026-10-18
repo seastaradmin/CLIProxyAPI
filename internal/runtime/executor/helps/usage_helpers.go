@@ -951,7 +951,10 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 		// Once an Anthropic event is seen, follow-up partial events (e.g.
 		// message_delta carrying only output_tokens) stay on the same path.
 		openAIDetails := hasOpenAIStyleUsageDetailBuckets(usageNode)
-		claudeStyle := hasClaudeStyleUsageTokenFields(usageNode) ||
+		// Some OpenAI-style upstreams (e.g. cline) attach cache_creation_input_tokens:0
+		// to an otherwise OpenAI usage block; presence of those *_details buckets means
+		// OpenAI-style usage, so the Claude branch must not claim it.
+		claudeStyle := (hasClaudeStyleUsageTokenFields(usageNode) && !openAIDetails) ||
 			(!openAIDetails && ((topLevel && usageNode.Get("input_tokens").Exists()) || (b.claudeStream && topLevel)))
 		switch {
 		case claudeStyle:

@@ -320,6 +320,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"protocols":    util.ProtocolsCSV(compat.Protocols),
 				"config_index": strconv.Itoa(i),
 			}
+			if compat.ClientProfile != "" {
+				attrs["client_profile"] = compat.ClientProfile
+			}
 			if compat.ResponseHeaderTimeoutSeconds != 0 {
 				attrs["response_header_timeout_seconds"] = strconv.Itoa(compat.ResponseHeaderTimeoutSeconds)
 			}
@@ -376,6 +379,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"provider_key": internalProviderKey,
 				"protocols":    util.ProtocolsCSV(compat.Protocols),
 				"config_index": strconv.Itoa(i),
+			}
+			if compat.ClientProfile != "" {
+				attrs["client_profile"] = compat.ClientProfile
 			}
 			if compat.ResponseHeaderTimeoutSeconds != 0 {
 				attrs["response_header_timeout_seconds"] = strconv.Itoa(compat.ResponseHeaderTimeoutSeconds)

@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -166,7 +167,7 @@ func (h *Handler) ProtocolProbeBatch(c *gin.Context) {
 		timeout = 90 * time.Second
 	}
 
-	client := &http.Client{Timeout: timeout}
+	client := helps.WithClientProfile(&http.Client{Timeout: timeout}, compat.ClientProfile)
 
 	// Probe all models in parallel.
 	results := make([]protocolProbeBatchModelResult, len(models))
